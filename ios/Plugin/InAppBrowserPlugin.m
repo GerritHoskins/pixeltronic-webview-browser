@@ -8,8 +8,6 @@ CAP_PLUGIN(InAppBrowserPlugin, "InAppBrowserPlugin",
            CAP_PLUGIN_METHOD(closeWebView, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(showWebView, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(hideWebView, CAPPluginReturnPromise);
-           CAP_PLUGIN_METHOD(openSystemBrowser, CAPPluginReturnPromise);
-           CAP_PLUGIN_METHOD(openBrowser, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(navigateBack, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(navigateForward, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(refresh, CAPPluginReturnPromise);

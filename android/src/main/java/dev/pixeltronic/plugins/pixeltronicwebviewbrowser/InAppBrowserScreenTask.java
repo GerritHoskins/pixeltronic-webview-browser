@@ -1,19 +1,18 @@
-package net.bitburst.plugins.inappbrowser;
+package dev.pixeltronic.plugins.pixeltronicwebviewbrowser;
 
-import static net.bitburst.plugins.inappbrowser.InAppBrowserPlugin.LOG_TAG;
+import static dev.pixeltronic.plugins.pixeltronicwebviewbrowser.InAppBrowserPlugin.LOG_TAG;
 
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.util.Base64;
 import android.webkit.WebView;
-
 import com.getcapacitor.JSObject;
 import com.getcapacitor.PluginCall;
-
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 
 public class InAppBrowserScreenTask implements Runnable {
+
     private final PluginCall call;
     private Exception exception;
     private final WebView webView;

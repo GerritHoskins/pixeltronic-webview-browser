@@ -1,5 +1,5 @@
 {
-  "name": "@bitburst-gmbh/capacitor-in-app-browser",
+  "name": "pixeltronic-webview-browser",
   "version": "5.0.4",
   "description": "capacitor plugin for delegating native web views",
   "main": "dist/plugin.cjs.js",
@@ -11,15 +11,12 @@
     "android/build.gradle",
     "dist/",
     "ios/Plugin/",
-    "BitburstGmbhCapacitorInAppBrowser.podspec"
+    "PixeltronicWebviewBrowser.podspec"
   ],
   "author": "",
   "license": "MIT",
   "repository": {
-    "url": "https://github.com/BitBurst-GmbH/capacitor-plugins"
-  },
-  "bugs": {
-    "url": "https://github.com/BitBurst-GmbH/capacitor-plugins/issues"
+    "url": "https://github.com/GerritHoskins/pixeltronic-webview-browser"
   },
   "keywords": [
     "capacitor",

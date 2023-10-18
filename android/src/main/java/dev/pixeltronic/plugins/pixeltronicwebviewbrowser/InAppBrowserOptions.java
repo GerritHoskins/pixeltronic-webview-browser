@@ -1,4 +1,4 @@
-package net.bitburst.plugins.inappbrowser;
+package dev.pixeltronic.plugins.pixeltronicwebviewbrowser;
 
 import android.content.Context;
 import com.getcapacitor.JSObject;

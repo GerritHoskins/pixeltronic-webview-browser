@@ -20,16 +20,6 @@ export interface InAppBrowserInterface {
    */
   showWebView(): Promise<void>;
   /**
-   * Open the native system browser (hard context change)
-   */
-  openSystemBrowser(options: { url: string }): Promise<void>;
-  /**
-   * Open the system browser inside the app (soft context change)
-   * Android (Custom Tabs - https://developer.chrome.com/docs/android/custom-tabs/)
-   * iOS (Safari Services - https://developer.apple.com/documentation/safariservices)
-   */
-  openBrowser(options: OpenOptions): Promise<void>;
-  /**
    * Handle back navigation inside the webview
    */
   navigateBack(): Promise<void>;
@@ -58,20 +48,6 @@ export interface InAppBrowserInterface {
    */
   onNavigation(listenerFunc: ListenerFunc<NavigationEvent>): Promise<void>;
   /**
-   * Event triggered by the system browser when moved to the app foreground
-   */
-  onBrowserVisible(
-    listenerFunc: ListenerFunc<BrowserVisibility>,
-  ): Promise<void>;
-  /**
-   * Event triggered by the system browser when URL loading has started
-   */
-  onBrowserPageLoadStarted(listenerFunc: ListenerFunc<void>): Promise<void>;
-  /**
-   * Event triggered by the system browser when the target URL has finished loading
-   */
-  onBrowserPageLoaded(listenerFunc: ListenerFunc<void>): Promise<void>;
-  /**
    * Event triggered by the webview when the target URL has finished loading
    */
   onPageLoaded(listenerFunc: ListenerFunc<PageLoadStatus>): Promise<void>;
@@ -81,12 +57,6 @@ export interface InAppBrowserInterface {
    */
   onPageLoadError(listenerFunc: ListenerFunc<ErrorCode>): Promise<void>;
   /**
-   * Event triggered by the system browser when navigating to the target URL has failed.
-   */
-  onBrowserPageNavigationFailed(
-    listenerFunc: ListenerFunc<void>,
-  ): Promise<void>;
-  /*
    * Event triggered by the webview when the webview is resized
    */
   onUpdateDimensions(listenerFunc: ListenerFunc<void>): Promise<void>;
@@ -96,7 +66,7 @@ export interface InAppBrowserInterface {
    *  This is needed if there are HTML/Javascript UI elements to be overlaid.
    */
   captureScreen(showScreenCapture: boolean): Promise<void>;
-  /*
+  /**
    * Update the dimensions of the webview
    */
   updateDimensions(options?: Dimensions): Promise<void>;
@@ -198,12 +168,7 @@ export type EventListeners =
   | 'updateDimensions'
   | 'updateScreenCapture'
   | 'navigationHandler'
-  | 'browserPageLoadStarted'
-  | 'browserPageNavigationFailed'
-  | 'browserPageLoaded'
-  | 'browserVisible'
   | 'pageLoadError';
 export type ErrorCode = { errorCode: number };
-export type BrowserVisibility = { visible: boolean };
 export type PageLoadStatus = { isLoading: boolean };
 export type ScreenShot = { src: string };

@@ -23,33 +23,24 @@ import WebKit
     }
 
     override public func loadView() {
-        self.webview = WKWebView(frame: .zero, configuration: self.configuration)
-        self.webview?.uiDelegate = self
-        self.webview?.navigationDelegate = self
+        let webview = WKWebView(frame: .zero, configuration: self.configuration)
+        webview.uiDelegate = self
+        webview.navigationDelegate = self
+        webview.backgroundColor = .white
+        webview.scrollView.bounces = false
+        webview.allowsBackForwardNavigationGestures = true
+        webview.isOpaque = false
+        webview.customUserAgent = userAgentToUse()
 
-        view = self.webview
-        view.backgroundColor = UIColor.white
-        view.isHidden = true
-        self.webview?.scrollView.bounces = false
-        self.webview?.allowsBackForwardNavigationGestures = true
-
-        self.webview?.isOpaque = false
-
-        self.setHeaders(headers: self.plugin.headers!)
-        self.webview?.customUserAgent = self.customUserAgent ?? self.userAgent ?? self.originalUserAgent
-
-        let blur = UIVisualEffectView(effect: UIBlurEffect(style: UIBlurEffect.Style.regular))
-        blur.clipsToBounds = true
-        blur.isUserInteractionEnabled = false
+        self.webview = webview
+        view = webview
     }
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         currentUrl = webView.url
-        if self.plugin?.savedCall != nil {
-            self.plugin?.savedCall?.resolve()
-            self.plugin?.savedCall = nil
-        }
-        self.sendLoadingEvent(false)
+        plugin?.savedCall?.resolve()
+        plugin?.savedCall = nil
+        sendLoadingEvent(false)
     }
 
     public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -111,55 +102,43 @@ import WebKit
         super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
     }
 
-    func setHeaders(headers: [String: String]) {
-        let userAgent = self.plugin.headers?["User-Agent"]
-        self.plugin.headers?.removeValue(forKey: "User-Agent")
-        if userAgent != nil {
-            self.customUserAgent = userAgent
+    func setHeaders() {
+        if let userAgent = plugin.headers?["User-Agent"] {
+            customUserAgent = userAgent
+            plugin.headers?.removeValue(forKey: "User-Agent")
         }
     }
 
-    func handleError(errorCode: NSNumber?) {
+    func handleError(errorCode: NSNumber) {
         if plugin.hasEventListeners(eventName: "pageLoadError") {
-            plugin.notifyEventListeners(eventName: "pageLoadError", eventValue: [
-                "errorCode": errorCode!
-            ])
+            plugin.notifyEventListeners(eventName: "pageLoadError", eventValue: ["errorCode": errorCode])
         }
-
-        self.sendLoadingEvent(false)
+        sendLoadingEvent(false)
     }
 
     func sendLoadingEvent(_ isLoading: Bool) {
         view.isHidden = isLoading
-        plugin.notifyEventListeners(eventName: "pageLoaded", eventValue: [
-            "isLoading": isLoading
-        ])
+        plugin.notifyEventListeners(eventName: "pageLoaded", eventValue: ["isLoading": isLoading])
     }
 
-    internal var customUserAgent: String? {
+    var customUserAgent: String? {
         didSet {
-            guard let agent = userAgent else {
-                return
-            }
-            self.webview?.customUserAgent = agent
+            webview?.customUserAgent = userAgentToUse()
         }
     }
 
     var userAgent: String? {
         didSet {
-            guard let originalUserAgent = originalUserAgent, let userAgent = userAgent else {
-                return
-            }
-            self.webview?.customUserAgent = [originalUserAgent, userAgent].joined(separator: " ")
+            webview?.customUserAgent = userAgentToUse()
         }
     }
 
-    var pureUserAgent: String? {
-        didSet {
-            guard let agent = pureUserAgent else {
-                return
-            }
-            self.webview?.customUserAgent = agent
+    private func userAgentToUse() -> String? {
+        if let customAgent = customUserAgent {
+            return customAgent
+        } else if let originalAgent = originalUserAgent, let userAgent = userAgent {
+            return "\(originalAgent) \(userAgent)"
         }
+        return nil
     }
 }

@@ -1,4 +1,4 @@
-package net.bitburst.plugins.inappbrowser;
+package dev.pixeltronic.plugins.pixeltronicwebviewbrowser;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
@@ -36,47 +36,26 @@ import java.util.concurrent.Executors;
 @CapacitorPlugin(name = "InAppBrowserPlugin", permissions = { @Permission(strings = { Manifest.permission.INTERNET }, alias = "internet") })
 public class InAppBrowserPlugin extends Plugin {
 
-    public WebView webView;
+    private static final String LOG_TAG = "pixeltronic";
+    private static final String NO_WEBVIEW_ERROR = "No valid InAppBrowser instance found";
+    private static final String MISSING_DIMENSIONS_ERROR = "Height or width is missing";
+    private static final String INVALID_MISSING_URL_ERROR = "must provide a valid URL to open";
 
-    public InAppBrowserOptions options;
-    public static final String LOG_TAG = "bitburst.inAppBrowser ";
-    public static final String NO_WEBVIEW_ERROR = "No valid InAppBrowser instance found";
-    public static final String MISSING_DIMENSIONS_ERROR = "Height or width is missing";
-    public static final String INVALID_MISSING_URL_ERROR = "must provide a valid URL to open";
-    private InAppBrowserCustomTabs customTabs = null;
-
+    private WebView webView;
+    private InAppBrowserOptions options;
     private boolean isLoading = false;
-
-    @Override
-    public void handleOnResume() {
-        if (customTabs != null) {
-            customTabs.bindService();
-        }
-    }
-
-    @Override
-    public void handleOnPause() {
-        if (customTabs != null) {
-            customTabs.unbindService();
-        }
-    }
 
     @Override
     public void load() {
         super.load();
         options = new InAppBrowserOptions(this.getContext());
-        if (
-            InAppBrowserHelper.isPackageInstalled(this.getContext(), "com.android.chrome") &&
-            InAppBrowserHelper.isChromeEnabled(this.getContext())
-        ) {
-            customTabs = new InAppBrowserCustomTabs(this);
-        }
     }
 
     @PluginMethod
     public void openWebView(final PluginCall call) {
         if (!InAppBrowserHelper.isPackageInstalled(this.getContext(), "com.google.android.webview")) {
             call.reject(LOG_TAG, "Android web view is not installed");
+            return;
         }
         options.setSavedCall(call);
         getActivity().runOnUiThread(this::configureWebView);
@@ -84,171 +63,90 @@ public class InAppBrowserPlugin extends Plugin {
 
     @PluginMethod
     public void closeWebView(final PluginCall call) {
-        getActivity()
-            .runOnUiThread(
-                () -> {
-                    if (webView != null) {
-                        ViewGroup rootGroup = ((ViewGroup) getBridge().getWebView().getParent());
-                        int count = rootGroup.getChildCount();
-                        if (count > 1) {
-                            rootGroup.removeView(webView);
-                            webView.destroyDrawingCache();
-                            webView.destroy();
-                            webView = null;
-                        }
-                    }
+        runOnUI(
+            () -> {
+                if (webViewExists()) {
+                    removeAndDestroyWebView();
                     options.setHidden(false);
                     call.resolve();
                 }
-            );
+            }
+        );
     }
 
     @PluginMethod
     public void showWebView(final PluginCall call) {
-        if (webView == null) {
-            call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-            return;
-        }
-        getActivity()
-            .runOnUiThread(
-                () -> {
-                    options.setHidden(false);
-                    webView.setVisibility(View.VISIBLE);
-                    call.resolve();
-                }
-            );
+        toggleWebViewVisibility(call, View.VISIBLE);
     }
 
     @PluginMethod
     public void hideWebView(final PluginCall call) {
-        if (webView == null) {
-            call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-            return;
-        }
-        getActivity()
-            .runOnUiThread(
-                () -> {
-                    options.setHidden(true);
-                    webView.setVisibility(View.INVISIBLE);
-                    call.resolve();
-                }
-            );
+        toggleWebViewVisibility(call, View.INVISIBLE);
     }
 
     @PluginMethod
     public void navigateBack(final PluginCall call) {
-        if (webView == null) {
-            call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-            return;
-        }
-        getActivity()
-            .runOnUiThread(
-                () -> {
-                    webView.goBack();
-                    call.resolve();
-                }
-            );
+        performWebViewAction(call, webView::goBack);
     }
 
     @PluginMethod
     public void navigateForward(final PluginCall call) {
-        if (webView == null) {
-            call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-            return;
-        }
-        getActivity()
-            .runOnUiThread(
-                () -> {
-                    webView.goForward();
-                    call.resolve();
-                }
-            );
+        performWebViewAction(call, webView::goForward);
     }
 
     @PluginMethod
     public void refresh(final PluginCall call) {
-        if (webView == null) {
-            call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-            return;
-        }
-        getActivity()
-            .runOnUiThread(
-                () -> {
-                    webView.reload();
-                    call.resolve();
-                }
-            );
+        performWebViewAction(call, webView::reload);
     }
 
     @PluginMethod
     public void loadUrl(final PluginCall call) {
         String urlString = call.getString("url");
-        if (urlString == null || urlString.isEmpty()) {
+        if (TextUtils.isEmpty(urlString)) {
             call.reject(LOG_TAG, INVALID_MISSING_URL_ERROR);
             return;
         }
 
-        if (webView == null) {
+        if (!webViewExists()) {
             call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
             return;
         }
 
         options.setSavedCall(call);
-        getActivity().runOnUiThread(() -> loadUrlWithHeaders(urlString));
+        runOnUI(() -> loadUrlWithHeaders(urlString));
     }
 
     @PluginMethod
     public void onNavigation(final PluginCall call) {
-        if (webView == null) {
+        if (!webViewExists()) {
             call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
             return;
         }
-
-        getActivity()
-            .runOnUiThread(
-                () -> {
-                    try {
-                        if (options.getTargetUrl() != null) {
-                            boolean allow = Boolean.TRUE.equals(call.getBoolean("allow", true));
-                            if (allow) {
-                                webView.loadUrl(options.getTargetUrl());
-                            } else {
-                                isLoading = false;
-                                sendLoadingEvent();
-                            }
-                            options.setTargetUrl(null);
-                        }
-                        call.resolve();
-                    } catch (Exception e) {
-                        call.reject(LOG_TAG, "Failed to navigate.", e);
-                    }
-                }
-            );
     }
 
     @PluginMethod
     public void updateDimensions(final PluginCall call) {
         if (webView != null) {
             getActivity()
-                    .runOnUiThread(
-                            () -> {
-                                setWebViewOptions(call);
+                .runOnUiThread(
+                    () -> {
+                        setWebViewOptions(call);
 
-                                ViewGroup.LayoutParams params = webView.getLayoutParams();
+                        ViewGroup.LayoutParams params = webView.getLayoutParams();
 
-                                params.width = options.getWidthInPixels();
-                                params.height = options.getHeightInPixels();
-                                webView.setX(options.getXInPixels());
-                                webView.setY(options.getYInPixels());
-                                webView.requestLayout();
+                        params.width = options.getWidthInPixels();
+                        params.height = options.getHeightInPixels();
+                        webView.setX(options.getXInPixels());
+                        webView.setY(options.getYInPixels());
+                        webView.requestLayout();
 
-                                if (options.isHidden()) {
-                                    // notifyListeners("captureScreen", new JSObject());
-                                }
+                        if (options.isHidden()) {
+                            // notifyListeners("captureScreen", new JSObject());
+                        }
 
-                                call.resolve();
-                            }
-                    );
+                        call.resolve();
+                    }
+                );
         }
     }
 
@@ -258,7 +156,7 @@ public class InAppBrowserPlugin extends Plugin {
             call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
             return;
         }
-        if(webView.getWidth() > 0 &&  webView.getHeight() > 0) {
+        if (webView.getWidth() > 0 && webView.getHeight() > 0) {
             Executor executor = Executors.newSingleThreadExecutor();
             executor.execute(new InAppBrowserScreenTask(call, webView));
         } else {
@@ -266,59 +164,49 @@ public class InAppBrowserPlugin extends Plugin {
         }
     }
 
-    @PluginMethod
-    public void openBrowser(final PluginCall call) {
-        if (customTabs != null) {
-            String urlString = call.getString("url");
-            if (urlString == null || urlString.isEmpty()) {
-                call.reject(LOG_TAG, INVALID_MISSING_URL_ERROR);
-                return;
-            }
-            Uri url;
-            try {
-                url = Uri.parse(urlString);
-            } catch (Exception ex) {
-                call.reject(ex.getLocalizedMessage());
-                return;
-            }
-
-            if (options != null) {
-                JSObject colorScheme = call.getObject("colorScheme");
-                if (colorScheme != null) {
-                    options.setColorScheme(colorScheme);
-                }
-                JSObject headers = call.getObject("headers");
-                if (headers != null) {
-                    options.setHeaders(headers);
+    private void performWebViewAction(final PluginCall call, Runnable action) {
+        runOnUI(
+            () -> {
+                if (webViewExists()) {
+                    action.run();
+                    call.resolve();
                 }
             }
-            customTabs.openBrowser(this.getContext(), url);
-            call.resolve();
-        }
+        );
     }
 
-    @PluginMethod
-    public void openSystemBrowser(final PluginCall call) {
-        String url = call.getString("url");
-        if (url == null || url.isEmpty()) {
-            call.reject(LOG_TAG, INVALID_MISSING_URL_ERROR);
-            return;
-        }
-
-        final PackageManager manager = this.getContext().getPackageManager();
-        Intent launchIntent = new Intent(Intent.ACTION_VIEW);
-        launchIntent.setData(Uri.parse(url));
-        try {
-            getActivity().startActivity(launchIntent);
-        } catch (Exception ex) {
-            launchIntent = manager.getLaunchIntentForPackage(url);
-            try {
-                getActivity().startActivity(launchIntent);
-            } catch (Exception expgk) {
-                call.reject(LOG_TAG, expgk.getLocalizedMessage());
+    private void toggleWebViewVisibility(final PluginCall call, int visibility) {
+        runOnUI(
+            () -> {
+                if (webViewExists()) {
+                    webView.setVisibility(visibility);
+                    call.resolve();
+                }
             }
+        );
+    }
+
+    private void runOnUI(Runnable action) {
+        getActivity().runOnUiThread(action);
+    }
+
+    private boolean webViewExists() {
+        if (webView == null) {
+            notifyError(NO_WEBVIEW_ERROR);
+            return false;
         }
-        call.resolve();
+        return true;
+    }
+
+    private void notifyError(String errorMessage) {
+        notifyListeners("error", new JSObject().put("message", errorMessage));
+    }
+
+    private void removeAndDestroyWebView() {
+        ViewGroup rootGroup = ((ViewGroup) getBridge().getWebView().getParent());
+        rootGroup.removeView(webView);
+        webView.destroy();
+        webView = null;
     }
 
     private void loadUrlWithHeaders(String urlString) {

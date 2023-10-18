@@ -1,14 +1,3 @@
-# @bitburst-gmbh/in-app-browser
-
-capacitor plugin for delegating native web views
-
-## Install
-
-```bash
-npm install @bitburst-gmbh/capacitor-in-app-browser
-npx cap sync
-```
-
 ## API
 
 <docgen-index>
@@ -17,19 +6,13 @@ npx cap sync
 * [`closeWebView()`](#closewebview)
 * [`hideWebView()`](#hidewebview)
 * [`showWebView()`](#showwebview)
-* [`openSystemBrowser(...)`](#opensystembrowser)
-* [`openBrowser(...)`](#openbrowser)
 * [`navigateBack()`](#navigateback)
 * [`navigateForward()`](#navigateforward)
 * [`loadUrl(...)`](#loadurl)
 * [`reload()`](#reload)
 * [`onNavigation(...)`](#onnavigation)
-* [`onBrowserVisible(...)`](#onbrowservisible)
-* [`onBrowserPageLoadStarted(...)`](#onbrowserpageloadstarted)
-* [`onBrowserPageLoaded(...)`](#onbrowserpageloaded)
 * [`onPageLoaded(...)`](#onpageloaded)
 * [`onPageLoadError(...)`](#onpageloaderror)
-* [`onBrowserPageNavigationFailed(...)`](#onbrowserpagenavigationfailed)
 * [`onUpdateDimensions(...)`](#onupdatedimensions)
 * [`captureScreen(...)`](#capturescreen)
 * [`updateDimensions(...)`](#updatedimensions)
@@ -87,38 +70,6 @@ showWebView() => Promise<void>
 ```
 
 Shows the current webview.
-
---------------------
-
-
-### openSystemBrowser(...)
-
-```typescript
-openSystemBrowser(options: { url: string; }) => Promise<void>
-```
-
-Open the native system browser (hard context change)
-
-| Param         | Type                          |
-| ------------- | ----------------------------- |
-| **`options`** | <code>{ url: string; }</code> |
-
---------------------
-
-
-### openBrowser(...)
-
-```typescript
-openBrowser(options: OpenOptions) => Promise<void>
-```
-
-Open the system browser inside the app (soft context change)
-Android (Custom Tabs - https://developer.chrome.com/docs/android/custom-tabs/)
-iOS (Safari Services - https://developer.apple.com/documentation/safariservices)
-
-| Param         | Type                                                |
-| ------------- | --------------------------------------------------- |
-| **`options`** | <code><a href="#openoptions">OpenOptions</a></code> |
 
 --------------------
 
@@ -194,51 +145,6 @@ request as desired.
 --------------------
 
 
-### onBrowserVisible(...)
-
-```typescript
-onBrowserVisible(listenerFunc: ListenerFunc<BrowserVisibility>) => Promise<void>
-```
-
-Event triggered by the system browser when moved to the app foreground
-
-| Param              | Type                                                                                                            |
-| ------------------ | --------------------------------------------------------------------------------------------------------------- |
-| **`listenerFunc`** | <code><a href="#listenerfunc">ListenerFunc</a>&lt;<a href="#browservisibility">BrowserVisibility</a>&gt;</code> |
-
---------------------
-
-
-### onBrowserPageLoadStarted(...)
-
-```typescript
-onBrowserPageLoadStarted(listenerFunc: ListenerFunc<void>) => Promise<void>
-```
-
-Event triggered by the system browser when URL loading has started
-
-| Param              | Type                                                              |
-| ------------------ | ----------------------------------------------------------------- |
-| **`listenerFunc`** | <code><a href="#listenerfunc">ListenerFunc</a>&lt;void&gt;</code> |
-
---------------------
-
-
-### onBrowserPageLoaded(...)
-
-```typescript
-onBrowserPageLoaded(listenerFunc: ListenerFunc<void>) => Promise<void>
-```
-
-Event triggered by the system browser when the target URL has finished loading
-
-| Param              | Type                                                              |
-| ------------------ | ----------------------------------------------------------------- |
-| **`listenerFunc`** | <code><a href="#listenerfunc">ListenerFunc</a>&lt;void&gt;</code> |
-
---------------------
-
-
 ### onPageLoaded(...)
 
 ```typescript
@@ -270,26 +176,13 @@ Returns the HTTP request error code.
 --------------------
 
 
-### onBrowserPageNavigationFailed(...)
-
-```typescript
-onBrowserPageNavigationFailed(listenerFunc: ListenerFunc<void>) => Promise<void>
-```
-
-Event triggered by the system browser when navigating to the target URL has failed.
-
-| Param              | Type                                                              |
-| ------------------ | ----------------------------------------------------------------- |
-| **`listenerFunc`** | <code><a href="#listenerfunc">ListenerFunc</a>&lt;void&gt;</code> |
-
---------------------
-
-
 ### onUpdateDimensions(...)
 
 ```typescript
 onUpdateDimensions(listenerFunc: ListenerFunc<void>) => Promise<void>
 ```
+
+Event triggered by the webview when the webview is resized
 
 | Param              | Type                                                              |
 | ------------------ | ----------------------------------------------------------------- |
@@ -320,6 +213,8 @@ This is needed if there are HTML/Javascript UI elements to be overlaid.
 ```typescript
 updateDimensions(options?: Dimensions) => Promise<void>
 ```
+
+Update the dimensions of the webview
 
 | Param         | Type                                              |
 | ------------- | ------------------------------------------------- |
@@ -374,11 +269,6 @@ updateDimensions(options?: Dimensions) => Promise<void>
 #### NavigationEvent
 
 <code>{ /** * current url being loaded */ url: string; /** * current url target (new window, i.e. _blank / _self, etc) */ newWindowRequest: boolean; /** * current url is from same host */ isSameHost: boolean; /** * complete current url loading */ complete: (allow: boolean) =&gt; void; }</code>
-
-
-#### BrowserVisibility
-
-<code>{ visible: boolean }</code>
 
 
 #### PageLoadStatus
