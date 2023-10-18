@@ -2,10 +2,7 @@ package dev.pixeltronic.plugins.pixeltronicwebviewbrowser;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
-import android.content.Intent;
-import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Message;
 import android.text.TextUtils;
@@ -19,12 +16,14 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
+
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.HashMap;
@@ -53,10 +52,10 @@ public class InAppBrowserPlugin extends Plugin {
 
     @PluginMethod
     public void openWebView(final PluginCall call) {
-        if (!InAppBrowserHelper.isPackageInstalled(this.getContext(), "com.google.android.webview")) {
+        /*if (!InAppBrowserHelper.isPackageInstalled(this.getContext(), "com.google.android.webview")) {
             call.reject(LOG_TAG, "Android web view is not installed");
             return;
-        }
+        }*/
         options.setSavedCall(call);
         getActivity().runOnUiThread(this::configureWebView);
     }
@@ -120,7 +119,6 @@ public class InAppBrowserPlugin extends Plugin {
     public void onNavigation(final PluginCall call) {
         if (!webViewExists()) {
             call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-            return;
         }
     }
 
@@ -274,7 +272,9 @@ public class InAppBrowserPlugin extends Plugin {
 
             ((ViewGroup) getBridge().getWebView().getParent()).addView(webView);
 
-            webView.loadUrl(urlString);
+            if (urlString != null) {
+                webView.loadUrl(urlString);
+            }
         } catch (Exception e) {
             isLoading = false;
             sendLoadingEvent();

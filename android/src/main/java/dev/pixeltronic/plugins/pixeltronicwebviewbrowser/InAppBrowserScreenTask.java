@@ -1,7 +1,5 @@
 package dev.pixeltronic.plugins.pixeltronicwebviewbrowser;
 
-import static dev.pixeltronic.plugins.pixeltronicwebviewbrowser.InAppBrowserPlugin.LOG_TAG;
-
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.util.Base64;
@@ -12,6 +10,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 
 public class InAppBrowserScreenTask implements Runnable {
+    private static final String LOG_TAG = "pixeltronic";
 
     private final PluginCall call;
     private Exception exception;
