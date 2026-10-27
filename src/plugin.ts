@@ -11,6 +11,7 @@ import type {
   ErrorCode,
   EventListeners,
   PageLoadStatus,
+  NavigationPolicy,
 } from './definitions';
 
 const InAppBrowserPlugin =
@@ -33,6 +34,7 @@ export class InAppBrowserClass implements InAppBrowserInterface {
   private snapshotUrl?: string;
   private cancelSnapshot?: () => void;
   private capturing = false;
+  private navigationPolicy?: Required<NavigationPolicy>;
 
   async openWebView(options: OpenOptions): Promise<void> {
     this.requireNative();
@@ -51,17 +53,42 @@ export class InAppBrowserClass implements InAppBrowserInterface {
         'A mounted container element is required.',
       );
     }
-    this.validateUrl(options.url);
+    const url = this.validateUrl(options.url);
+    const policy = this.preparePolicy(url, options.navigationPolicy);
+    this.enforcePolicy(url, policy);
     this.validateHeaders(options.headers);
     const bounds = this.getDimensions(options.element);
     this.state = 'opening';
+    this.navigationPolicy = policy;
     this.element = options.element;
     const generation = ++this.generation;
     let nativeOpened = false;
+    let lifecycleListener: PluginListenerHandle | undefined;
     try {
+      lifecycleListener = await InAppBrowserPlugin.addListener(
+        'browserClosed',
+        () => {
+          if (generation !== this.generation) return;
+          this.state = 'closed';
+          ++this.generation;
+          ++this.listenerGeneration;
+          this.clearViewResources();
+          const handles = [...this.listeners];
+          this.listeners.clear();
+          void Promise.all(handles.map(handle => handle.remove())).catch(
+            error => console.error('WebView listener cleanup failed.', error),
+          );
+        },
+      );
+      if (generation !== this.generation) {
+        await lifecycleListener.remove();
+        throw failure('CANCELLED', 'The WebView was closed while opening.');
+      }
+      this.listeners.add(lifecycleListener);
       await InAppBrowserPlugin.openWebView({
-        url: options.url,
+        url: url.href,
         headers: options.headers,
+        navigationPolicy: policy,
         ...bounds,
       });
       nativeOpened = true;
@@ -83,6 +110,10 @@ export class InAppBrowserClass implements InAppBrowserInterface {
         else {
           this.state = 'closed';
           this.clearViewResources();
+          if (lifecycleListener) {
+            this.listeners.delete(lifecycleListener);
+            await lifecycleListener.remove();
+          }
         }
       }
       throw error;
@@ -136,16 +167,22 @@ export class InAppBrowserClass implements InAppBrowserInterface {
 
   async loadUrl(options: { url: string }): Promise<void> {
     this.requireOpen();
-    this.validateUrl(options?.url);
+    const url = this.validateUrl(options?.url);
+    this.enforcePolicy(url, this.navigationPolicy);
     const generation = this.generation;
     try {
-      await InAppBrowserPlugin.loadUrl(options);
+      await InAppBrowserPlugin.loadUrl({ url: url.href });
       if (generation !== this.generation)
         throw failure('CANCELLED', 'The WebView was closed.');
     } catch (error) {
       if (
         generation === this.generation &&
-        ['LOAD_FAILED', 'LOAD_TIMEOUT', 'DESTROYED'].includes(error?.code)
+        [
+          'LOAD_FAILED',
+          'LOAD_TIMEOUT',
+          'DESTROYED',
+          'NAVIGATION_BLOCKED',
+        ].includes(error?.code)
       ) {
         this.state = 'closed';
         ++this.generation;
@@ -185,8 +222,13 @@ export class InAppBrowserClass implements InAppBrowserInterface {
     await this.addListener('navigationHandler', event =>
       listener({
         ...event,
-        complete: (allow: boolean) =>
-          InAppBrowserPlugin.onNavigation({ allow }),
+        complete: () =>
+          Promise.reject(
+            failure(
+              'UNIMPLEMENTED',
+              'Navigation is decided natively. Configure navigationPolicy before opening.',
+            ),
+          ),
       }),
     );
   }
@@ -326,16 +368,86 @@ export class InAppBrowserClass implements InAppBrowserInterface {
       );
   }
 
-  private validateUrl(url: string): void {
+  private validateUrl(url: string): URL {
     try {
       if (typeof url !== 'string' || !url || /\s/.test(url)) throw new Error();
-      new URL(url);
+      const parsed = new URL(url);
+      if (
+        parsed.port &&
+        (Number(parsed.port) < 1 || Number(parsed.port) > 65535)
+      )
+        throw new Error();
+      return parsed;
     } catch {
       throw failure(
         'INVALID_ARGUMENT',
         'An absolute URL without whitespace is required.',
       );
     }
+  }
+
+  private preparePolicy(
+    url: URL,
+    policy?: NavigationPolicy,
+  ): Required<NavigationPolicy> {
+    if (
+      policy !== undefined &&
+      (!policy || typeof policy !== 'object' || Array.isArray(policy))
+    ) {
+      throw failure('INVALID_ARGUMENT', 'navigationPolicy must be an object.');
+    }
+    if (
+      policy?.allowHttp !== undefined &&
+      typeof policy.allowHttp !== 'boolean'
+    ) {
+      throw failure('INVALID_ARGUMENT', 'allowHttp must be a boolean.');
+    }
+    let origins = [url.origin];
+    if (policy?.allowedOrigins !== undefined) {
+      if (
+        !Array.isArray(policy.allowedOrigins) ||
+        policy.allowedOrigins.length === 0
+      ) {
+        throw failure(
+          'INVALID_ARGUMENT',
+          'allowedOrigins must be a nonempty array of exact origins.',
+        );
+      }
+      origins = policy.allowedOrigins.map(origin => {
+        const parsed = this.validateUrl(origin);
+        if (
+          !['https:', 'http:'].includes(parsed.protocol) ||
+          !parsed.hostname ||
+          parsed.hostname.includes('*') ||
+          parsed.username ||
+          parsed.password ||
+          parsed.pathname !== '/' ||
+          origin.includes('?') ||
+          origin.includes('#')
+        ) {
+          throw failure(
+            'INVALID_ARGUMENT',
+            'allowedOrigins must contain exact HTTP(S) origins without paths or credentials.',
+          );
+        }
+        return parsed.origin;
+      });
+    }
+    return {
+      allowedOrigins: [...new Set(origins)],
+      allowHttp: policy?.allowHttp ?? false,
+    };
+  }
+
+  private enforcePolicy(url: URL, policy: Required<NavigationPolicy>): void {
+    if (!['https:', 'http:'].includes(url.protocol))
+      throw failure('POLICY_BLOCKED', 'SCHEME_BLOCKED');
+    if (url.username || url.password)
+      throw failure('POLICY_BLOCKED', 'CREDENTIALS_BLOCKED');
+    if (url.protocol === 'http:' && !policy.allowHttp)
+      throw failure('POLICY_BLOCKED', 'HTTPS_REQUIRED');
+    if (!policy.allowedOrigins.includes(url.origin))
+      throw failure('POLICY_BLOCKED', 'ORIGIN_BLOCKED');
   }
 
   private validateHeaders(headers: OpenOptions['headers']): void {
@@ -404,5 +516,6 @@ export class InAppBrowserClass implements InAppBrowserInterface {
     this.resizeObserver = undefined;
     this.releaseSnapshot();
     this.element = undefined;
+    this.navigationPolicy = undefined;
   }
 }

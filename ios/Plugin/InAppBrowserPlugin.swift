@@ -68,6 +68,78 @@ enum BrowserInput {
     }
 }
 
+/// Immutable document-navigation rules; not a firewall for page subresources or network traffic.
+struct BrowserNavigationPolicy {
+    struct Decision {
+        let allowed: Bool
+        let reason: String
+    }
+    private let origins: Set<String>
+    private let allowHttp: Bool
+
+    init(initialURL: URL, allowedOrigins: [String]? = nil, allowHttp: Bool = false) throws {
+        self.allowHttp = allowHttp
+        if let values = allowedOrigins {
+            guard !values.isEmpty else { throw BrowserInputError(message: "allowedOrigins must not be empty.") }
+            var normalized = Set<String>()
+            for value in values {
+                guard value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+                      let components = URLComponents(string: value), let url = components.url,
+                      let origin = Self.origin(url), components.query == nil, components.fragment == nil,
+                      components.path.isEmpty || components.path == "/" else {
+                    throw BrowserInputError(message: "allowedOrigins must contain exact HTTP(S) origins without paths, credentials, queries or fragments.")
+                }
+                normalized.insert(origin)
+            }
+            origins = normalized
+        } else {
+            origins = Self.origin(initialURL).map { Set([$0]) } ?? []
+        }
+    }
+
+    static func from(_ call: CAPPluginCall, initialURL: URL) throws -> BrowserNavigationPolicy {
+        guard let raw = call.options["navigationPolicy"] else { return try BrowserNavigationPolicy(initialURL: initialURL) }
+        guard let policy = raw as? [String: Any] else { throw BrowserInputError(message: "navigationPolicy must be an object.") }
+        var http = false
+        if let rawHttp = policy["allowHttp"] {
+            guard let value = rawHttp as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
+                throw BrowserInputError(message: "allowHttp must be a boolean.")
+            }
+            http = value.boolValue
+        }
+        var origins: [String]?
+        if let rawOrigins = policy["allowedOrigins"] {
+            guard let values = rawOrigins as? [String] else { throw BrowserInputError(message: "allowedOrigins must be an array of strings.") }
+            origins = values
+        }
+        return try BrowserNavigationPolicy(initialURL: initialURL, allowedOrigins: origins, allowHttp: http)
+    }
+
+    func evaluate(_ url: URL?) -> Decision {
+        guard let url = url, let scheme = url.scheme?.lowercased() else { return Decision(allowed: false, reason: "INVALID_URL") }
+        guard scheme == "https" || scheme == "http" else { return Decision(allowed: false, reason: "SCHEME_BLOCKED") }
+        guard url.user == nil && url.password == nil else { return Decision(allowed: false, reason: "CREDENTIALS_BLOCKED") }
+        guard let origin = Self.origin(url) else { return Decision(allowed: false, reason: "INVALID_URL") }
+        guard scheme != "http" || allowHttp else { return Decision(allowed: false, reason: "HTTPS_REQUIRED") }
+        return origins.contains(origin) ? Decision(allowed: true, reason: "ALLOWED") : Decision(allowed: false, reason: "ORIGIN_BLOCKED")
+    }
+
+    static let popupBlocked = Decision(allowed: false, reason: "POPUP_BLOCKED")
+
+    static func origin(_ url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              url.user == nil, url.password == nil, var host = url.host?.lowercased(),
+              !host.isEmpty, !host.contains("*"), host.unicodeScalars.allSatisfy({ $0.isASCII }) else { return nil }
+        if let port = url.port, port < 1 || port > 65535 { return nil }
+        if host.contains(":") && !host.hasPrefix("[") { host = "[\(host)]" }
+        if let port = url.port, !((scheme == "https" && port == 443) || (scheme == "http" && port == 80)) {
+            return "\(scheme)://\(host):\(port)"
+        }
+        return "\(scheme)://\(host)"
+    }
+}
+
+
 @objc(InAppBrowserPlugin)
 public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "InAppBrowserPlugin"
@@ -96,8 +168,8 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     var timeoutInterval: TimeInterval = 30
 
     // These hooks keep native integration testable without network traffic.
-    @MainActor func makeBrowser(headers: [String: String]) -> InAppBrowser {
-        InAppBrowser(self, configuration: WKWebViewConfiguration(), headers: headers)
+    @MainActor func makeBrowser(headers: [String: String], policy: BrowserNavigationPolicy) -> InAppBrowser {
+        InAppBrowser(self, configuration: WKWebViewConfiguration(), headers: headers, policy: policy)
     }
 
     @MainActor func attachBrowser(_ browser: InAppBrowser, bounds: CGRect) throws {
@@ -138,8 +210,11 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             let url = try BrowserInput.url(call)
             let bounds = try BrowserInput.bounds(call)
             let headers = try BrowserInput.headers(call)
+            let policy = try BrowserNavigationPolicy.from(call, initialURL: url)
+            let decision = policy.evaluate(url)
+            guard decision.allowed else { response.reject("POLICY_BLOCKED", decision.reason); return }
             guard self.inAppBrowser == nil else { response.reject("BUSY", "Close the existing WebView before opening another."); return }
-            let browser = self.makeBrowser(headers: headers)
+            let browser = self.makeBrowser(headers: headers, policy: policy)
             self.inAppBrowser = browser
             do { try self.attachBrowser(browser, bounds: bounds) }
             catch {
@@ -148,6 +223,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 return
             }
             self.startLoad(response, browser: browser, url: url)
+            self.recordNavigation(browser, url: url, popup: false, mainFrame: true, decision: decision)
         }
     }
 
@@ -186,7 +262,11 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func loadUrl(_ call: CAPPluginCall) {
         withBrowser(call, idle: true) { browser, response in
-            self.startLoad(response, browser: browser, url: try BrowserInput.url(call))
+            let url = try BrowserInput.url(call)
+            let decision = browser.navigationPolicy.evaluate(url)
+            self.recordNavigation(browser, url: url, popup: false, mainFrame: true, decision: decision)
+            guard decision.allowed else { response.reject("POLICY_BLOCKED", decision.reason); return }
+            self.startLoad(response, browser: browser, url: url)
         }
     }
 
@@ -195,11 +275,23 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func onNavigation(_ call: CAPPluginCall) {
-        withBrowser(call) { browser, response in
-            guard let allow = call.getBool("allow") else { response.reject("INVALID_ARGUMENT", "A boolean allow value is required."); return }
-            guard browser.currentDecisionHandler != nil else { response.reject("NO_PENDING_NAVIGATION", "No navigation decision is pending."); return }
-            browser.completeDecision(allow ? .allow : .cancel)
-            response.resolve()
+        withBrowser(call) { _, response in
+            response.reject("UNIMPLEMENTED", "Navigation decisions are applied natively. Configure navigationPolicy before opening the WebView.")
+        }
+    }
+
+    @MainActor func recordNavigation(_ browser: InAppBrowser, url: URL?, popup: Bool, mainFrame: Bool,
+                                    decision: BrowserNavigationPolicy.Decision, late: Bool = false) {
+        guard browser === inAppBrowser else { return }
+        let sourceHost = browser.webview?.url?.host?.lowercased()
+        notifyEventListeners(eventName: "navigationHandler", eventValue: [
+            "url": url?.absoluteString ?? "", "newWindowRequest": popup, "isMainFrame": mainFrame,
+            "isSameHost": sourceHost != nil && sourceHost == url?.host?.lowercased(),
+            "allowed": decision.allowed, "reason": decision.reason
+        ])
+        if !decision.allowed && !popup && mainFrame && (pendingLoad != nil || late) {
+            closeInternal("NAVIGATION_BLOCKED", "Navigation was blocked by policy: \(decision.reason)")
+            notifyEventListeners(eventName: "browserClosed", eventValue: ["reason": "NAVIGATION_BLOCKED"])
         }
     }
 
@@ -309,7 +401,6 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         closeInternal("CANCELLED", "The plugin was destroyed.")
     }
 
-    @MainActor func hasEventListeners(eventName: String) -> Bool { hasListeners(eventName) }
     @MainActor func notifyEventListeners(eventName: String, eventValue: [String: Any]) {
         notifyListeners(eventName, data: eventValue, retainUntilConsumed: eventName == "pageLoaded")
     }

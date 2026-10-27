@@ -7,25 +7,24 @@ import WebKit
     weak var plugin: InAppBrowserPlugin?
     private let configuration: WKWebViewConfiguration
     private let headers: [String: String]
-    private(set) var currentDecisionHandler: ((WKNavigationResponsePolicy) -> Void)?
-    private var decisionTimeout: DispatchWorkItem?
-    private var decisionGeneration = 0
-    private var openNewWindow = false
-    private var currentUrl: URL?
+    let navigationPolicy: BrowserNavigationPolicy
     private var disposed = false
     private var loading = false
     var hidden = false
 
-    init(_ plugin: InAppBrowserPlugin, configuration: WKWebViewConfiguration, headers: [String: String] = [:]) {
+    init(_ plugin: InAppBrowserPlugin, configuration: WKWebViewConfiguration,
+         headers: [String: String] = [:], policy: BrowserNavigationPolicy) {
         self.plugin = plugin
         self.configuration = configuration
         self.headers = headers
+        self.navigationPolicy = policy
         super.init(nibName: nil, bundle: nil)
     }
 
     required init?(coder: NSCoder) { return nil }
 
     override public func loadView() {
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.uiDelegate = self
         view.navigationDelegate = self
@@ -39,14 +38,13 @@ import WebKit
     }
 
     @discardableResult func loadUrl(_ url: URL) -> WKNavigation? {
-        guard !disposed else { return nil }
+        guard !disposed, navigationPolicy.evaluate(url).allowed else { return nil }
         loadViewIfNeeded()
         return webview?.load(URLRequest(url: url))
     }
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard !disposed else { return }
-        currentUrl = webView.url
+        guard !disposed, checkCommittedURL(webView) else { return }
         plugin?.navigationFinished(self, navigation: navigation)
         sendLoadingEvent(false)
     }
@@ -71,47 +69,48 @@ import WebKit
         sendLoadingEvent(true)
     }
 
+    public func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard !disposed else { return }
+        _ = checkCommittedURL(webView)
+    }
+
+    private func checkCommittedURL(_ webView: WKWebView) -> Bool {
+        guard let url = webView.url else { return true }
+        let decision = navigationPolicy.evaluate(url)
+        if !decision.allowed {
+            plugin?.recordNavigation(self, url: url, popup: false, mainFrame: true, decision: decision, late: true)
+        }
+        return decision.allowed
+    }
+
     public func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                         for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         guard !disposed else { return nil }
-        if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
-            openNewWindow = true
-            loadUrl(url)
-        }
+        plugin?.recordNavigation(self, url: navigationAction.request.url, popup: true, mainFrame: true,
+                                 decision: BrowserNavigationPolicy.popupBlocked)
         return nil
+    }
+
+    public func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard !disposed else { decisionHandler(.cancel); return }
+        let popup = navigationAction.targetFrame == nil
+        let decision = popup ? BrowserNavigationPolicy.popupBlocked : navigationPolicy.evaluate(navigationAction.request.url)
+        // Allow WebKit's original request, including POST bodies, rather than replaying it.
+        decisionHandler(decision.allowed ? .allow : .cancel)
+        plugin?.recordNavigation(self, url: navigationAction.request.url, popup: popup,
+                                 mainFrame: navigationAction.targetFrame?.isMainFrame ?? true, decision: decision)
     }
 
     public func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                         decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         guard !disposed else { decisionHandler(.cancel); return }
-        completeDecision(.cancel)
-        guard plugin?.hasEventListeners(eventName: "navigationHandler") == true else { decisionHandler(.allow); return }
-        currentDecisionHandler = decisionHandler
-        let generation = decisionGeneration
-        let timeout = DispatchWorkItem { [weak self] in
-            DispatchQueue.main.async {
-                guard let self = self, self.decisionGeneration == generation else { return }
-                self.completeDecision(.cancel)
-            }
+        let decision = navigationPolicy.evaluate(navigationResponse.response.url)
+        decisionHandler(decision.allowed ? .allow : .cancel)
+        if !decision.allowed {
+            plugin?.recordNavigation(self, url: navigationResponse.response.url, popup: false,
+                                     mainFrame: navigationResponse.isForMainFrame, decision: decision, late: true)
         }
-        decisionTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
-        plugin?.notifyEventListeners(eventName: "navigationHandler", eventValue: [
-            "url": navigationResponse.response.url?.absoluteString ?? "",
-            "newWindowRequest": openNewWindow,
-            "isSameHost": currentUrl?.host != nil && currentUrl?.host == navigationResponse.response.url?.host
-        ])
-        openNewWindow = false
-    }
-
-    func completeDecision(_ policy: WKNavigationResponsePolicy) {
-        decisionGeneration += 1
-        decisionTimeout?.cancel()
-        decisionTimeout = nil
-        let handler = currentDecisionHandler
-        currentDecisionHandler = nil
-        handler?(policy)
-        if handler != nil && policy == .cancel { sendLoadingEvent(false) }
     }
 
     func snapshot(_ completion: @escaping (UIImage?, Error?) -> Void) {
@@ -133,7 +132,6 @@ import WebKit
     func dispose() {
         guard !disposed else { return }
         disposed = true
-        completeDecision(.cancel)
         webview?.stopLoading()
         webview?.navigationDelegate = nil
         webview?.uiDelegate = nil

@@ -10,6 +10,11 @@ import android.webkit.WebViewClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceResponse;
+import android.webkit.WebChromeClient;
+import android.net.Uri;
+import android.os.Message;
+import com.getcapacitor.JSObject;
+import org.json.JSONArray;
 import com.getcapacitor.PluginCall;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -27,6 +32,7 @@ public class InAppBrowserPluginTest {
         final List<Runnable> timeouts = new ArrayList<>();
         final WebView view = mock(WebView.class);
         int creations;
+        final List<String> decisions = new ArrayList<>();
 
         Harness() {
             when(view.getSettings()).thenReturn(mock(WebSettings.class));
@@ -39,6 +45,8 @@ public class InAppBrowserPluginTest {
         @Override protected void attachWebView(WebView view, InAppBrowserOptions.Bounds bounds) {}
         @Override protected void loadingEvent() {}
         @Override protected void emitLoadError(int code) {}
+        @Override protected void emitNavigation(String url, boolean popup, boolean mainFrame, NavigationPolicy.Decision decision) { decisions.add(decision.reason); }
+        @Override protected void emitBrowserClosed(String reason) {}
         void drain() { while (!ui.isEmpty()) ui.remove().run(); }
         WebViewClient client() {
             ArgumentCaptor<WebViewClient> captor = ArgumentCaptor.forClass(WebViewClient.class);
@@ -201,5 +209,84 @@ public class InAppBrowserPluginTest {
         Harness plugin = new Harness(); plugin.open(); plugin.finish();
         PluginCall decision = validCall(); when(decision.getBoolean("allow")).thenReturn(true);
         plugin.onNavigation(decision); plugin.drain(); rejected(decision, "UNIMPLEMENTED");
+    }
+
+    private static WebResourceRequest request(String url, boolean mainFrame) {
+        WebResourceRequest request = mock(WebResourceRequest.class);
+        Uri uri = mock(Uri.class); when(uri.toString()).thenReturn(url);
+        when(request.getUrl()).thenReturn(uri); when(request.isForMainFrame()).thenReturn(mainFrame);
+        return request;
+    }
+
+    @Test public void insecureOpenIsRejectedBeforeAllocation() {
+        Harness plugin = new Harness(); PluginCall call = validCall();
+        when(call.getString("url")).thenReturn("http://example.com");
+        plugin.openWebView(call); plugin.drain();
+        rejected(call, "POLICY_BLOCKED"); assertEquals(0, plugin.creations);
+    }
+
+    @Test public void allowedNavigationDoesNotNeedAListenerOrReplayTheRequest() {
+        Harness plugin = new Harness(); PluginCall open = plugin.open();
+        String next = URL + "/next";
+        assertFalse(plugin.client().shouldOverrideUrlLoading(plugin.view, request(next, true)));
+        WebResourceRequest post = request(next, true); when(post.getMethod()).thenReturn("POST");
+        assertNull(plugin.client().shouldInterceptRequest(plugin.view, post));
+        verify(plugin.view, times(1)).loadUrl(anyString());
+        when(plugin.view.getUrl()).thenReturn(next);
+        plugin.client().onPageFinished(plugin.view, next); verify(open).resolve();
+    }
+
+    @Test public void forbiddenRedirectRejectsPendingLoadInsteadOfTimingOut() {
+        Harness plugin = new Harness(); PluginCall open = plugin.open();
+        WebViewClient client = plugin.client();
+        assertTrue(client.shouldOverrideUrlLoading(plugin.view, request("https://evil.test", true)));
+        rejected(open, "NAVIGATION_BLOCKED");
+        assertTrue(plugin.decisions.contains("ORIGIN_BLOCKED")); verify(plugin.view).destroy();
+        client.onPageFinished(plugin.view, URL); verify(open, never()).resolve();
+    }
+
+    @Test public void configuredRedirectOriginPreservesTheOriginalLoad() {
+        Harness plugin = new Harness(); PluginCall open = validCall();
+        JSObject policy = mock(JSObject.class); JSONArray origins = mock(JSONArray.class);
+        when(policy.has("allowedOrigins")).thenReturn(true); when(policy.opt("allowedOrigins")).thenReturn(origins);
+        when(origins.length()).thenReturn(2); when(origins.opt(0)).thenReturn(URL); when(origins.opt(1)).thenReturn("https://login.example.com");
+        when(open.getObject("navigationPolicy")).thenReturn(policy);
+        plugin.openWebView(open); plugin.drain();
+        assertFalse(plugin.client().shouldOverrideUrlLoading(plugin.view, request("https://login.example.com/login", true)));
+        verify(plugin.view, times(1)).loadUrl(anyString()); plugin.finish(); verify(open).resolve();
+    }
+
+    @Test public void blockedPostIsInterceptedWithoutTouchingViewsOnTheWorker() throws Exception {
+        Harness plugin = new Harness(); PluginCall open = plugin.open();
+        WebViewClient client = plugin.client();
+        java.util.concurrent.FutureTask<WebResourceResponse> task = new java.util.concurrent.FutureTask<>(
+            () -> client.shouldInterceptRequest(plugin.view, request("https://evil.test/post", true)));
+        Thread worker = new Thread(task); worker.start();
+        assertNotNull(task.get(5, java.util.concurrent.TimeUnit.SECONDS)); worker.join();
+        verify(plugin.view, never()).destroy();
+        plugin.drain(); rejected(open, "NAVIGATION_BLOCKED");
+    }
+
+    @Test public void blockedSubframeDoesNotCancelTheMainFrameLoad() {
+        Harness plugin = new Harness(); PluginCall open = plugin.open();
+        assertTrue(plugin.client().shouldOverrideUrlLoading(plugin.view, request("https://evil.test/frame", false)));
+        verify(open, never()).reject(anyString(), anyString()); plugin.finish(); verify(open).resolve();
+    }
+
+    @Test public void popupIsRejectedWithoutCreatingAnotherWebView() {
+        Harness plugin = new Harness(); plugin.open(); plugin.finish();
+        ArgumentCaptor<WebChromeClient> chrome = ArgumentCaptor.forClass(WebChromeClient.class);
+        verify(plugin.view).setWebChromeClient(chrome.capture());
+        assertFalse(chrome.getValue().onCreateWindow(plugin.view, false, true, mock(Message.class)));
+        assertEquals(1, plugin.creations); assertTrue(plugin.decisions.contains("POPUP_BLOCKED"));
+    }
+
+    @Test public void webSettingsDisableFileAccessAndMixedContent() {
+        Harness plugin = new Harness(); plugin.open();
+        WebSettings settings = plugin.view.getSettings();
+        verify(settings).setAllowFileAccess(false); verify(settings).setAllowContentAccess(false);
+        verify(settings).setAllowFileAccessFromFileURLs(false); verify(settings).setAllowUniversalAccessFromFileURLs(false);
+        verify(settings).setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        verify(settings).setJavaScriptCanOpenWindowsAutomatically(false);
     }
 }

@@ -23,7 +23,8 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
-import java.net.URI;
+import java.io.ByteArrayInputStream;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -42,6 +43,8 @@ public class InAppBrowserPlugin extends Plugin {
     private CallResult pendingLoad;
     private Runnable loadTimeout;
     private Map<String, String> headers = new HashMap<>();
+    private NavigationPolicy navigationPolicy;
+    private String initialUrl;
     private final Map<CallResult, Runnable> captures = new HashMap<>();
     private ExecutorService encoder;
     private Handler handler;
@@ -52,18 +55,24 @@ public class InAppBrowserPlugin extends Plugin {
             String url = InAppBrowserOptions.url(call.getString("url"));
             InAppBrowserOptions.Bounds bounds = InAppBrowserOptions.Bounds.from(call);
             Map<String, String> requestHeaders = InAppBrowserOptions.headers(call);
+            NavigationPolicy policy = NavigationPolicy.from(call, url);
+            NavigationPolicy.Decision decision = policy.evaluate(url);
+            if (!decision.allowed) { result.reject("POLICY_BLOCKED", decision.reason); return; }
             if (webView != null) { result.reject("BUSY", "Close the existing WebView before opening another."); return; }
             WebView view = createWebView();
             webView = view;
             headers = requestHeaders;
+            navigationPolicy = policy;
+            initialUrl = url;
             hidden = false;
             opening = true;
             openingOwner = result;
             configureWebSettings(view);
-            view.setWebViewClient(createWebViewClient());
+            view.setWebViewClient(createWebViewClient(policy));
             view.setWebChromeClient(createWebChromeClient());
             attachWebView(view, bounds);
             beginLoad(result);
+            emitNavigation(url, false, true, decision);
             // Header behavior is unchanged in Stage 1; policy/parity is handled separately.
             view.loadUrl(url);
         });
@@ -93,6 +102,9 @@ public class InAppBrowserPlugin extends Plugin {
     public void loadUrl(PluginCall call) {
         withView(call, true, (view, result) -> {
             String url = InAppBrowserOptions.url(call.getString("url"));
+            NavigationPolicy.Decision decision = navigationPolicy.evaluate(url);
+            emitNavigation(url, false, true, decision);
+            if (!decision.allowed) { result.reject("POLICY_BLOCKED", decision.reason); return; }
             beginLoad(result);
             loadUrlWithHeaders(view, url);
         });
@@ -111,7 +123,7 @@ public class InAppBrowserPlugin extends Plugin {
     public void onNavigation(PluginCall call) {
         withView(call, false, (view, result) -> {
             if (call.getBoolean("allow") == null) throw new IllegalArgumentException("A boolean allow value is required.");
-            result.reject("UNIMPLEMENTED", "Android navigation decisions are not implemented.");
+            result.reject("UNIMPLEMENTED", "Navigation decisions are applied natively. Configure navigationPolicy before opening the WebView.");
         });
     }
 
@@ -231,6 +243,8 @@ public class InAppBrowserPlugin extends Plugin {
         }
         captures.clear();
         headers = new HashMap<>();
+        navigationPolicy = null;
+        initialUrl = null;
         hidden = false;
         loading = false;
         if (view != null) {
@@ -240,7 +254,10 @@ public class InAppBrowserPlugin extends Plugin {
             if (view.getParent() instanceof ViewGroup) ((ViewGroup) view.getParent()).removeView(view);
             view.destroy();
         }
+        if (view != null && "NAVIGATION_BLOCKED".equals(code)) emitBrowserClosed(code);
     }
+
+    protected void emitBrowserClosed(String reason) { notifyListeners("browserClosed", new JSObject().put("reason", reason)); }
 
     @Override
     protected void handleOnDestroy() {
@@ -264,17 +281,17 @@ public class InAppBrowserPlugin extends Plugin {
     @SuppressLint("SetJavaScriptEnabled")
     private void configureWebSettings(WebView view) {
         WebSettings settings = view.getSettings();
-        settings.setJavaScriptCanOpenWindowsAutomatically(true);
+        settings.setJavaScriptCanOpenWindowsAutomatically(false);
         settings.setJavaScriptEnabled(true);
         settings.setDatabaseEnabled(true);
         settings.setDomStorageEnabled(true);
-        settings.setAllowContentAccess(true);
-        settings.setAllowFileAccess(true);
-        settings.setAllowFileAccessFromFileURLs(true);
-        settings.setAllowUniversalAccessFromFileURLs(true);
+        settings.setAllowContentAccess(false);
+        settings.setAllowFileAccess(false);
+        settings.setAllowFileAccessFromFileURLs(false);
+        settings.setAllowUniversalAccessFromFileURLs(false);
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setSupportMultipleWindows(true);
     }
 
@@ -282,33 +299,26 @@ public class InAppBrowserPlugin extends Plugin {
         return new WebChromeClient() {
             @Override public boolean onCreateWindow(WebView view, boolean dialog, boolean userGesture, Message message) {
                 if (view != webView) return false;
-                WebView popup = createWebView();
-                popup.setWebViewClient(new WebViewClient() {
-                    @Override public void onLoadResource(WebView child, String url) {
-                        if (webView == view) {
-                            if (hasListeners("navigationHandler")) navigationEvent(url, true);
-                            else view.loadUrl(url);
-                        }
-                        child.stopLoading();
-                        child.destroy();
-                    }
-                });
-                ((WebView.WebViewTransport) message.obj).setWebView(popup);
-                message.sendToTarget();
-                return true;
+                // Android does not expose the target URL here. Never allocate an orphan popup.
+                emitNavigation("", true, true, NavigationPolicy.popupBlocked());
+                return false;
             }
         };
     }
 
-    private WebViewClient createWebViewClient() {
+    private WebViewClient createWebViewClient(NavigationPolicy policy) {
         return new WebViewClient() {
             @Override public void onPageStarted(WebView view, String url, Bitmap icon) {
                 if (view != webView) return;
+                NavigationPolicy.Decision decision = policy.evaluate(url);
+                if (!decision.allowed) { blockNavigation(view, url, true, decision, true); return; }
                 loading = true;
                 loadingEvent();
             }
             @Override public void onPageFinished(WebView view, String url) {
                 if (view != webView || (view.getUrl() != null && !url.equals(view.getUrl()))) return;
+                NavigationPolicy.Decision decision = policy.evaluate(url);
+                if (!decision.allowed) { blockNavigation(view, url, true, decision, true); return; }
                 loading = false;
                 finishLoad(null, null);
                 loadingEvent();
@@ -316,14 +326,29 @@ public class InAppBrowserPlugin extends Plugin {
             @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 if (view == webView && request.isForMainFrame()) pageFailed(error.getErrorCode());
             }
+            @Override public void onPageCommitVisible(WebView view, String url) {
+                if (view != webView) return;
+                NavigationPolicy.Decision decision = policy.evaluate(url);
+                if (!decision.allowed) blockNavigation(view, url, true, decision, true);
+            }
             @Override public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse response) {
                 if (view == webView && request.isForMainFrame()) pageFailed(response.getStatusCode());
             }
+            @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                return blockNavigation(view, request.getUrl().toString(), request.isForMainFrame(), policy.evaluate(request.getUrl().toString()));
+            }
             @Override public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                if (view != webView) return true;
-                if (!hasListeners("navigationHandler")) return false;
-                navigationEvent(url, false);
-                return true;
+                return blockNavigation(view, url, true, policy.evaluate(url));
+            }
+            @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                // This callback runs on a worker and also covers main-frame POST requests.
+                // Only the immutable policy is read here; all view/state access is posted to main.
+                if (!request.isForMainFrame()) return null;
+                String url = request.getUrl().toString();
+                NavigationPolicy.Decision decision = policy.evaluate(url);
+                if (decision.allowed) return null;
+                runOnUI(() -> blockNavigation(view, url, true, decision));
+                return new WebResourceResponse("text/plain", "UTF-8", 403, "Forbidden", Collections.emptyMap(), new ByteArrayInputStream(new byte[0]));
             }
         };
     }
@@ -343,15 +368,23 @@ public class InAppBrowserPlugin extends Plugin {
     private void updateVisibility() { if (webView != null) webView.setVisibility(hidden || loading ? View.INVISIBLE : View.VISIBLE); }
     protected void loadingEvent() { updateVisibility(); notifyListeners("pageLoaded", new JSObject().put("isLoading", loading), true); }
 
-    private void navigationEvent(String url, boolean newWindow) {
-        if (webView == null) return;
-        try {
-            URI current = new URI(webView.getUrl());
-            URI target = new URI(url);
-            boolean sameHost = current.getHost() != null && current.getHost().equalsIgnoreCase(target.getHost());
-            notifyListeners("navigationHandler", new JSObject().put("url", url).put("newWindowRequest", newWindow).put("isSameHost", sameHost));
-        } catch (Exception ignored) {
-            // Invalid/non-hierarchical targets have no comparable host.
+    private boolean blockNavigation(WebView view, String url, boolean mainFrame, NavigationPolicy.Decision decision) {
+        return blockNavigation(view, url, mainFrame, decision, false);
+    }
+
+    private boolean blockNavigation(WebView view, String url, boolean mainFrame, NavigationPolicy.Decision decision, boolean late) {
+        if (view != webView) return true;
+        emitNavigation(url, false, mainFrame, decision);
+        if (!decision.allowed && mainFrame && (pendingLoad != null || late)) {
+            closeInternal("NAVIGATION_BLOCKED", "Navigation was blocked by policy: " + decision.reason);
         }
+        return !decision.allowed;
+    }
+
+    protected void emitNavigation(String url, boolean newWindow, boolean mainFrame, NavigationPolicy.Decision decision) {
+        String source = webView == null || webView.getUrl() == null ? initialUrl : webView.getUrl();
+        notifyListeners("navigationHandler", new JSObject().put("url", url).put("newWindowRequest", newWindow)
+            .put("isSameHost", NavigationPolicy.sameHost(source, url)).put("isMainFrame", mainFrame)
+            .put("allowed", decision.allowed).put("reason", decision.reason));
     }
 }

@@ -50,9 +50,9 @@ final class InAppBrowserTests: XCTestCase {
 
     private final class PluginHarness: InAppBrowserPlugin {
         var browser: Browser?
-        override func makeBrowser(headers: [String: String]) -> InAppBrowser {
+        override func makeBrowser(headers: [String: String], policy: BrowserNavigationPolicy) -> InAppBrowser {
             XCTAssertTrue(Thread.isMainThread)
-            let browser = Browser(self, configuration: WKWebViewConfiguration(), headers: headers)
+            let browser = Browser(self, configuration: WKWebViewConfiguration(), headers: headers, policy: policy)
             self.browser = browser
             return browser
         }
@@ -232,5 +232,92 @@ final class InAppBrowserTests: XCTestCase {
         let owned = BrowserResponse(record.call())
         owned.reject("CANCELLED", "closed"); owned.resolve(); owned.reject("LOAD_FAILED", "late")
         XCTAssertEqual(record.errors, ["CANCELLED"]); XCTAssertEqual(record.successes, 0)
+    }
+
+    func testBlockedProgrammaticNavigationLeavesTheExistingViewOpen() async {
+        let plugin = PluginHarness(); _ = await open(plugin); finish(plugin)
+        let blocked = Record()
+        plugin.loadUrl(blocked.call(["url": "https://untrusted.test/path"]))
+        await drain()
+        XCTAssertEqual(blocked.errors, ["POLICY_BLOCKED"])
+        XCTAssertNotNil(plugin.inAppBrowser)
+        plugin.tearDownBrowser()
+    }
+
+    func testForbiddenRedirectSettlesPendingLoadAndIgnoresLateCompletion() async {
+        let plugin = PluginHarness(); let initial = await open(plugin)
+        let browser = plugin.browser!, target = URL(string: "https://untrusted.test")!
+        plugin.recordNavigation(browser, url: target, popup: false, mainFrame: true,
+                                decision: browser.navigationPolicy.evaluate(target))
+        XCTAssertEqual(initial.errors, ["NAVIGATION_BLOCKED"])
+        XCTAssertNil(plugin.inAppBrowser)
+        plugin.navigationFinished(browser, navigation: browser.navigation)
+        XCTAssertEqual(initial.successes, 0)
+    }
+
+    func testBlockedPopupDoesNotHoldOrCancelTheParentLoad() async {
+        let plugin = PluginHarness(); let initial = await open(plugin)
+        plugin.recordNavigation(plugin.browser!, url: URL(string: "https://example.com/popup"), popup: true,
+                                mainFrame: true, decision: BrowserNavigationPolicy.popupBlocked)
+        XCTAssertTrue(initial.errors.isEmpty); XCTAssertNotNil(plugin.inAppBrowser)
+        finish(plugin); XCTAssertEqual(initial.successes, 1)
+        let lateDecision = Record(); plugin.onNavigation(lateDecision.call(["allow": true])); await drain()
+        XCTAssertEqual(lateDecision.errors, ["UNIMPLEMENTED"])
+        plugin.tearDownBrowser()
+    }
+
+    func testLateForbiddenDocumentClosesAnOtherwiseIdleView() async {
+        let plugin = PluginHarness(); _ = await open(plugin); finish(plugin)
+        let browser = plugin.browser!, target = URL(string: "https://untrusted.test")!
+        plugin.recordNavigation(browser, url: target, popup: false, mainFrame: true,
+                                decision: browser.navigationPolicy.evaluate(target), late: true)
+        XCTAssertNil(plugin.inAppBrowser); XCTAssertTrue(browser.disposed)
+    }
+}
+
+final class NavigationPolicyTests: XCTestCase {
+    func testDefaultsMatchExactHttpsOriginAndNormalizeDefaultPorts() throws {
+        let policy = try BrowserNavigationPolicy(initialURL: URL(string: "https://example.com/start")!)
+        XCTAssertTrue(policy.evaluate(URL(string: "https://EXAMPLE.COM:443/next?q=1")).allowed)
+        XCTAssertEqual(policy.evaluate(URL(string: "https://example.com.evil.test")).reason, "ORIGIN_BLOCKED")
+        XCTAssertEqual(policy.evaluate(URL(string: "https://example.com:8443")).reason, "ORIGIN_BLOCKED")
+        XCTAssertEqual(policy.evaluate(URL(string: "http://example.com")).reason, "HTTPS_REQUIRED")
+    }
+
+    func testLocalActiveAndCustomSchemesAndCredentialsAreBlocked() throws {
+        let policy = try BrowserNavigationPolicy(initialURL: URL(string: "https://example.com")!)
+        for value in ["file:///tmp/private", "content://provider/file", "javascript:alert(1)", "data:text/html,hello", "intent://example", "about:blank"] {
+            XCTAssertEqual(policy.evaluate(URL(string: value)).reason, "SCHEME_BLOCKED")
+        }
+        XCTAssertEqual(policy.evaluate(URL(string: "https://user:secret@example.com")).reason, "CREDENTIALS_BLOCKED")
+    }
+
+    func testExplicitOriginsAllowTrustedRedirectsAndHttpOptIn() throws {
+        let policy = try BrowserNavigationPolicy(initialURL: URL(string: "https://example.com")!,
+            allowedOrigins: ["https://example.com/", "https://login.example.com", "http://localhost:8080"], allowHttp: true)
+        XCTAssertTrue(policy.evaluate(URL(string: "https://login.example.com/login")).allowed)
+        XCTAssertTrue(policy.evaluate(URL(string: "http://localhost:8080/form")).allowed)
+        XCTAssertFalse(policy.evaluate(URL(string: "http://localhost:8081/form")).allowed)
+        XCTAssertFalse(policy.evaluate(URL(string: "https://login.example.com.evil.test")).allowed)
+    }
+
+    func testHttpOriginWithoutOptInRemainsBlocked() throws {
+        let policy = try BrowserNavigationPolicy(initialURL: URL(string: "https://example.com")!,
+            allowedOrigins: ["https://example.com", "http://localhost:8080"])
+        XCTAssertEqual(policy.evaluate(URL(string: "http://localhost:8080/form")).reason, "HTTPS_REQUIRED")
+    }
+
+    func testMalformedOriginRulesAreRejected() throws {
+        for value in ["*", "https://*.example.com", "https://example.com/path", "https://example.com?", "https://example.com#",
+                      "https://user@example.com", "file:///tmp", "https://example.com:0"] {
+            XCTAssertThrowsError(try BrowserNavigationPolicy(initialURL: URL(string: "https://example.com")!, allowedOrigins: [value]))
+        }
+        XCTAssertThrowsError(try BrowserNavigationPolicy(initialURL: URL(string: "https://example.com")!, allowedOrigins: []))
+    }
+
+    func testIpv6OriginMatchingIncludesPorts() throws {
+        let policy = try BrowserNavigationPolicy(initialURL: URL(string: "https://[::1]:443")!)
+        XCTAssertTrue(policy.evaluate(URL(string: "https://[::1]/next")).allowed)
+        XCTAssertFalse(policy.evaluate(URL(string: "https://[::1]:8443")).allowed)
     }
 }

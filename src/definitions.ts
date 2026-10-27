@@ -36,15 +36,9 @@ export interface InAppBrowserInterface {
    */
   reload(): Promise<void>;
   /**
-   * Event callback when the webview URL changes.
-   * Response parameters:
-   * newWindowRequest: boolean;
-   * isSameHost: boolean;
-   * complete: boolean;
-   * This can be used to decide what to do when a URL is requested in a new window
-   * from the same or different host origin. The callback event.complete(true/false)
-   * can be used to cancel or continue the load process and to handle the window
-   * request as desired.
+   * Observe a document-navigation decision already applied by the native policy.
+   * Listeners cannot pause, replay, allow or cancel the request.
+   * Configure navigationPolicy on openWebView to control allowed destinations.
    */
   onNavigation(listenerFunc: ListenerFunc<NavigationEvent>): Promise<void>;
   /**
@@ -87,7 +81,7 @@ export interface NativeInterface {
   updateDimensions(options?: Dimensions): Promise<void>;
   captureScreen(options?: Dimensions): Promise<ScreenShot>;
   addListener(
-    eventName: EventListeners,
+    eventName: EventListeners | 'browserClosed',
     listenerFunc: (...args: any[]) => void,
   ): Promise<PluginListenerHandle>;
 }
@@ -109,7 +103,30 @@ export interface OpenOptions extends Dimensions {
    * Set the color scheme for safari system browser and custom tabs
    */
   colorScheme?: ColorScheme;
+  /** Native document-navigation policy. Defaults to HTTPS at the initial origin. */
+  navigationPolicy?: NavigationPolicy;
 }
+
+/**
+ * Document navigation rules, not network isolation. Subresources and renderer-managed
+ * redirects can issue requests before native document callbacks. In particular,
+ * Android 307 POST redirects may send their body before the final document is blocked.
+ */
+export interface NavigationPolicy {
+  /** Exact HTTP(S) document origins. Defaults to the initial origin. No wildcards. Popups are blocked. */
+  allowedOrigins?: string[];
+  /** Opt in to HTTP document navigation. Does not enable mixed content or override host transport restrictions. */
+  allowHttp?: boolean;
+}
+
+export type NavigationDecisionReason =
+  | 'ALLOWED'
+  | 'INVALID_URL'
+  | 'SCHEME_BLOCKED'
+  | 'CREDENTIALS_BLOCKED'
+  | 'HTTPS_REQUIRED'
+  | 'ORIGIN_BLOCKED'
+  | 'POPUP_BLOCKED';
 export interface ColorScheme {
   /**
    * Set the toolbar color
@@ -159,9 +176,14 @@ export type NavigationEvent = {
    */
   isSameHost: boolean;
   /**
-   *  complete current url loading
+   * Legacy decision callback retained only to report the unsupported operation.
    */
-  complete: (allow: boolean) => void;
+  /** Native decision already applied; listeners cannot stall, replay or override the request. */
+  allowed: boolean;
+  reason: NavigationDecisionReason;
+  isMainFrame: boolean;
+  /** @deprecated Configure navigationPolicy before opening. Calling this method rejects with UNIMPLEMENTED. */
+  complete: (allow: boolean) => Promise<void>;
 };
 export type EventListeners =
   | 'pageLoaded'

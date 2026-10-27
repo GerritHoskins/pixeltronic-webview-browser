@@ -70,6 +70,8 @@ public class BrowserThreadingTest {
         }
         @Override protected void loadingEvent() {}
         @Override protected void emitLoadError(int code) {}
+        @Override protected void emitNavigation(String url, boolean popup, boolean mainFrame, NavigationPolicy.Decision decision) {}
+        @Override protected void emitBrowserClosed(String reason) {}
     }
 
     private Harness harness() {

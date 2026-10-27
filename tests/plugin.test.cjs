@@ -108,6 +108,7 @@ test('close while opening cancels the caller and concurrent closes share native 
   backend.openWebView = () => pending.promise;
   backend.closeWebView = () => { calls.push(['close']); pending.reject(Object.assign(new Error(), { code: 'CANCELLED' })); return closing.promise; };
   const opening = assert.rejects(open(), code('CANCELLED'));
+  await tick();
   const firstClose = plugin.closeWebView();
   const secondClose = plugin.closeWebView();
   closing.resolve();
@@ -176,7 +177,7 @@ test('terminal native load failure closes wrapper state and permits reopening', 
   const { backend, plugin, open, observers } = setup();
   await open();
   backend.loadUrl = async () => { throw Object.assign(new Error(), { code: 'LOAD_TIMEOUT' }); };
-  await assert.rejects(plugin.loadUrl({ url: 'https://example.org' }), code('LOAD_TIMEOUT'));
+  await assert.rejects(plugin.loadUrl({ url: 'https://example.com/next' }), code('LOAD_TIMEOUT'));
   assert.equal(observers.filter(o => o.active).length, 0);
   await assert.rejects(plugin.reload(), code('NOT_OPEN'));
   await open();
@@ -188,7 +189,7 @@ test('late failure from an old load cannot clear a reopened session', async () =
   await open();
   const pending = deferred();
   backend.loadUrl = () => pending.promise;
-  const oldLoad = assert.rejects(plugin.loadUrl({ url: 'https://example.org' }), code('LOAD_FAILED'));
+  const oldLoad = assert.rejects(plugin.loadUrl({ url: 'https://example.com/next' }), code('LOAD_FAILED'));
   await plugin.closeWebView();
   await open();
   pending.reject(Object.assign(new Error(), { code: 'LOAD_FAILED' }));
@@ -227,4 +228,88 @@ test('decode failure and close during screenshot both reject and release tempora
     assert.equal(revoked.length, 1);
     await plugin.closeWebView();
   }
+});
+
+test('default policy blocks insecure, local, active and credential URLs before native allocation', async () => {
+  for (const url of ['http://example.com', 'file:///tmp/private', 'content://provider/file',
+    'javascript:alert(1)', 'data:text/html,hello', 'https://user:secret@example.com']) {
+    const { plugin, element, calls } = setup();
+    await assert.rejects(plugin.openWebView({ url, element }), code('POLICY_BLOCKED'));
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('exact origin defaults allow same-origin URLs and reject lookalikes or different ports', async () => {
+  const { plugin, calls, open } = setup();
+  await open();
+  const nativeOpen = calls.find(call => call[0] === 'openWebView')[1];
+  assert.equal(JSON.stringify(nativeOpen.navigationPolicy), JSON.stringify({ allowedOrigins: ['https://example.com'], allowHttp: false }));
+  await plugin.loadUrl({ url: 'https://EXAMPLE.COM:443/next' });
+  for (const url of ['https://example.com.evil.test', 'https://other.example.com', 'https://example.com:8443']) {
+    await assert.rejects(plugin.loadUrl({ url }), code('POLICY_BLOCKED'));
+  }
+  assert.equal(calls.filter(call => call[0] === 'loadUrl').length, 1);
+  await plugin.closeWebView();
+});
+
+test('explicit origin configuration is copied and HTTP needs opt-in', async () => {
+  const { plugin, element, calls } = setup();
+  const allowedOrigins = ['https://example.com', 'https://login.example.com', 'http://localhost:8080'];
+  await plugin.openWebView({ url: 'https://example.com', element, navigationPolicy: { allowedOrigins, allowHttp: true } });
+  allowedOrigins.push('https://untrusted.test');
+  await plugin.loadUrl({ url: 'https://login.example.com/login' });
+  await plugin.loadUrl({ url: 'http://localhost:8080/fixture' });
+  await assert.rejects(plugin.loadUrl({ url: 'https://untrusted.test' }), code('POLICY_BLOCKED'));
+  assert.equal(calls.filter(call => call[0] === 'loadUrl').length, 2);
+  await plugin.closeWebView();
+  const secure = setup();
+  await secure.plugin.openWebView({ url: 'https://example.com', element: secure.element,
+    navigationPolicy: { allowedOrigins: ['https://example.com', 'http://localhost:8080'] } });
+  await assert.rejects(secure.plugin.loadUrl({ url: 'http://localhost:8080' }), code('POLICY_BLOCKED'));
+  await secure.plugin.closeWebView();
+});
+
+test('invalid policy values and origin patterns reject without native side effects', async () => {
+  for (const navigationPolicy of [null, [], { allowHttp: 'yes' }, { allowedOrigins: [] },
+    ...['*', 'https://*.example.com', 'https://example.com/path', 'https://example.com?',
+      'https://example.com#', 'https://user@example.com', 'https://example.com:0'].map(origin => ({ allowedOrigins: [origin] }))]) {
+    const { plugin, element, calls } = setup();
+    await assert.rejects(plugin.openWebView({ url: 'https://example.com', element, navigationPolicy }), code('INVALID_ARGUMENT'));
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('navigation observation cannot hold a native decision or send a late JavaScript override', async () => {
+  const { plugin, backend, calls, open } = setup();
+  let emit, observed;
+  backend.addListener = async (name, callback) => { if (name === 'navigationHandler') emit = callback; return { remove: async () => {} }; };
+  await plugin.onNavigation(event => { observed = event; });
+  await open();
+  emit({ url: 'https://example.com/next', allowed: true, reason: 'ALLOWED', isMainFrame: true, newWindowRequest: false });
+  assert.equal(observed.allowed, true);
+  await assert.rejects(observed.complete(false), code('UNIMPLEMENTED'));
+  assert.equal(calls.filter(call => call[0] === 'onNavigation').length, 0);
+  await plugin.reload();
+  await plugin.closeWebView();
+});
+
+test('blocked redirect closes the failed load session and allows a fresh open', async () => {
+  const { plugin, backend, open } = setup();
+  await open();
+  backend.loadUrl = async () => { throw Object.assign(new Error('blocked redirect'), { code: 'NAVIGATION_BLOCKED' }); };
+  await assert.rejects(plugin.loadUrl({ url: 'https://example.com/redirect' }), code('NAVIGATION_BLOCKED'));
+  await assert.rejects(plugin.reload(), code('NOT_OPEN'));
+  await open();
+  await plugin.closeWebView();
+});
+
+test('a native policy closure updates wrapper state even without a public navigation listener', async () => {
+  const { plugin, backend, open } = setup();
+  let closed;
+  backend.addListener = async (name, callback) => { if (name === 'browserClosed') closed = callback; return { remove: async () => {} }; };
+  await open();
+  closed({ reason: 'NAVIGATION_BLOCKED' });
+  await assert.rejects(plugin.reload(), code('NOT_OPEN'));
+  await open();
+  await plugin.closeWebView();
 });
