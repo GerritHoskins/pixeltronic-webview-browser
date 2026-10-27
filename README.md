@@ -29,13 +29,46 @@ The plugin uses `WKWebView` on iOS and `android.webkit.WebView` on Android. The 
 
 The Android module defaults to AppCompat `1.8.0`, Browser `1.10.0`, and CoordinatorLayout `1.3.0`. Host apps can override the versions through the corresponding Gradle project properties.
 
-This branch targets Capacitor 8. Upgrade Capacitor 5–7 apps before integrating it. The plugin's own package version (`5.0.4`) is separate from its Capacitor compatibility requirement.
+This branch targets Capacitor 8. Upgrade Capacitor 5–7 apps before integrating it. The plugin's own package version (`0.0.1`) is separate from its Capacitor compatibility requirement.
 
 ## Installation
 
-Build and install a local package from this repository:
+### npm (recommended)
 
-First, clone and build the plugin:
+Install the published package from the public npm registry:
+
+```sh
+npm install @gerrithoskins/pixeltronic-webview-browser@0.0.1
+npx cap sync
+```
+
+If this scope was previously configured for GitHub Packages, set the following in your app's `.npmrc` to use npm instead:
+
+```ini
+@gerrithoskins:registry=https://registry.npmjs.org/
+```
+
+### GitHub Packages
+
+GitHub Packages uses the same package name and version but a different registry. Configure the scope in your app's `.npmrc`:
+
+```ini
+@gerrithoskins:registry=https://npm.pkg.github.com/
+```
+
+Authenticate with your GitHub username and a personal access token (classic) with `read:packages`. Use the token as the password at the prompt; do not put it in the project's `.npmrc` or commit it.
+
+```sh
+npm login --scope=@gerrithoskins --auth-type=legacy --registry=https://npm.pkg.github.com/
+npm install @gerrithoskins/pixeltronic-webview-browser@0.0.1
+npx cap sync
+```
+
+GitHub requires authentication even for public npm packages hosted in GitHub Packages. If the package is private, your GitHub account must also have access. See [GitHub's npm registry documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry).
+
+### Build from source
+
+To use a local build instead of either registry:
 
 ```sh
 git clone https://github.com/GerritHoskins/pixeltronic-webview-browser.git
@@ -45,15 +78,14 @@ npm run build
 npm pack
 ```
 
-Then, from your Capacitor app directory, install the generated tarball and sync the native projects:
+From your Capacitor app directory, install the generated tarball:
 
 ```sh
-npm install /path/to/pixeltronic-webview-browser/pixeltronic-webview-browser-5.0.4.tgz
+npm install /path/to/pixeltronic-webview-browser/gerrithoskins-pixeltronic-webview-browser-0.0.1.tgz
 npx cap sync
 ```
 
-Replace the path with the tarball's actual location. Build the plugin before packing it: the package entry points use the generated `dist/` directory. Rebuild your native app after syncing.
-
+Build before packing: the package entry points use the generated `dist/` directory. Rebuild your native app after installing and syncing through any of these paths.
 ## Quick start
 
 Create a visible container with nonzero dimensions:
@@ -73,7 +105,7 @@ Open the WebView after the element has mounted and layout is ready:
 
 ```typescript
 import { Capacitor } from '@capacitor/core';
-import { InAppBrowser } from 'pixeltronic-webview-browser';
+import { InAppBrowser } from '@gerrithoskins/pixeltronic-webview-browser';
 
 async function openBrowser(): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
@@ -100,7 +132,7 @@ Pass the required `HTMLElement` itself, rather than its ID. Initial coordinates 
 Use these controls after opening a WebView:
 
 ```typescript
-import { InAppBrowser } from 'pixeltronic-webview-browser';
+import { InAppBrowser } from '@gerrithoskins/pixeltronic-webview-browser';
 
 async function navigate(): Promise<void> {
   await InAppBrowser.loadUrl({ url: 'https://example.com/help' });
@@ -125,7 +157,7 @@ async function closeBrowser(): Promise<void> {
 The default document policy allows HTTPS navigation at the initial origin. Configure exact additional origins before opening when redirects or login pages require them:
 
 ```typescript
-import { InAppBrowser } from 'pixeltronic-webview-browser';
+import { InAppBrowser } from '@gerrithoskins/pixeltronic-webview-browser';
 
 async function openTrustedBrowser(element: HTMLElement): Promise<void> {
   await InAppBrowser.openWebView({
@@ -149,7 +181,7 @@ The wrapper coalesces container resizing, captured scroll events, window/visual-
 To force a remeasurement, call `updateDimensions()` without arguments. For explicit CSS bounds:
 
 ```typescript
-import { InAppBrowser } from 'pixeltronic-webview-browser';
+import { InAppBrowser } from '@gerrithoskins/pixeltronic-webview-browser';
 
 async function syncBrowserBounds(element: HTMLElement): Promise<void> {
   const { width, height, x, y } = element.getBoundingClientRect();
@@ -171,7 +203,7 @@ Register listeners once, before opening the WebView, to observe loading and erro
 
 ```typescript
 import { Capacitor } from '@capacitor/core';
-import { InAppBrowser } from 'pixeltronic-webview-browser';
+import { InAppBrowser } from '@gerrithoskins/pixeltronic-webview-browser';
 
 async function registerBrowserEvents(): Promise<() => Promise<void>> {
   if (!Capacitor.isNativePlatform()) return async () => {};
@@ -199,7 +231,7 @@ Every listener helper returns a `PluginListenerHandle`. Await `handle.remove()` 
 `captureScreen(true)` captures the native view, displays the image as the container's background, and hides the live WebView. This lets HTML UI appear above a static representation of the page.
 
 ```typescript
-import { InAppBrowser } from 'pixeltronic-webview-browser';
+import { InAppBrowser } from '@gerrithoskins/pixeltronic-webview-browser';
 
 async function showSnapshot(): Promise<void> {
   await InAppBrowser.captureScreen(true);

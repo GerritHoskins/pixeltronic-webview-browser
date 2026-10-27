@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const root = path.resolve(__dirname, '..');
 const ts = require(path.join(root, 'node_modules/typescript'));
+const manifest = require(path.join(root, 'package.json'));
 const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
 const blocks = [...readme.matchAll(/```typescript\r?\n([\s\S]*?)```/g)];
 let errors = [];
@@ -12,7 +13,7 @@ for (const [i, match] of blocks.entries()) {
     target: ts.ScriptTarget.ES2017, module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Node10,
     esModuleInterop: true, baseUrl: root,
-    paths: { 'pixeltronic-webview-browser': ['dist/esm/index.d.ts'] },
+    paths: { [manifest.name]: ['dist/esm/index.d.ts'] },
   };
   const host = ts.createCompilerHost(options);
   const originalGetSourceFile = host.getSourceFile.bind(host);

@@ -1,0 +1,37 @@
+name: Publish GitHub Packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-github-packages-0.0.1
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Copy the published npm artifact to GitHub Packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          package='@gerrithoskins/pixeltronic-webview-browser'
+          version='0.0.1'
+          destination="$RUNNER_TEMP/pixeltronic-package"
+          mkdir -p "$destination"
+          npm pack "$package@$version" --registry=https://registry.npmjs.org/ --ignore-scripts --pack-destination "$destination"
+          printf '%s\n' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "$RUNNER_TEMP/pixeltronic-npmrc"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pixeltronic-npmrc"
+          archive="$destination/gerrithoskins-pixeltronic-webview-browser-$version.tgz"
+          npm publish "$archive" --registry=https://npm.pkg.github.com/ --access=public --ignore-scripts
+          npm view "$package@$version" name version --registry=https://npm.pkg.github.com/

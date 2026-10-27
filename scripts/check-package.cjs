@@ -3,6 +3,12 @@ const path = require('node:path');
 const assert = require('node:assert/strict');
 const { root, run } = require('./run.cjs');
 const manifest = require('../package.json');
+assert.equal(manifest.name, manifest.name.toLowerCase(), 'npm package names and scopes must be lowercase.');
+const lock = require('../package-lock.json');
+assert.equal(lock.name, manifest.name, 'Lockfile package name must match package.json.');
+assert.equal(lock.packages[''].name, manifest.name, 'Lockfile root package name must match package.json.');
+assert.equal(lock.version, manifest.version, 'Lockfile version must match package.json.');
+assert.equal(lock.packages[''].version, manifest.version, 'Lockfile root version must match package.json.');
 const [packed] = JSON.parse(run('npm', ['pack', '--dry-run', '--ignore-scripts', '--json'], { capture: true }));
 const files = new Set(packed.files.map(file => file.path));
 const required = [manifest.main, manifest.module, manifest.types, 'dist/plugin.js', 'Package.swift',
