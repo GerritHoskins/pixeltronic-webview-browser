@@ -15,7 +15,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function setup({ observeFailure = false } = {}) {
+function setup({ observeFailure = false, layout = false } = {}) {
   const calls = [], observers = [], images = [], revoked = [];
   const backend = new Proxy({}, { get: (target, key) => target[key] ?? (async (...args) => {
     calls.push([key, ...args]);
@@ -32,9 +32,20 @@ function setup({ observeFailure = false } = {}) {
     static revokeObjectURL(url) { revoked.push(url); }
   }
   const platform = { native: true };
+  function target() {
+    const listeners = new Map();
+    return { addEventListener: (event, callback) => listeners.set(event, callback),
+      removeEventListener: event => listeners.delete(event), emit: event => listeners.get(event)?.(), listeners };
+  }
+  const frames = new Map(); let nextFrame = 0;
+  const window = { ...target(), devicePixelRatio: 2,
+    requestAnimationFrame: callback => { frames.set(++nextFrame, callback); return nextFrame; },
+    cancelAnimationFrame: id => frames.delete(id) };
+  if (layout) Object.assign(window, { innerWidth: 400, innerHeight: 800,
+    visualViewport: { ...target(), width: 400, height: 800, offsetLeft: 0, offsetTop: 0 } });
   const context = {
     exports: {}, console, URL: TestURL, Blob, setTimeout, clearTimeout,
-    window: { devicePixelRatio: 2 },
+    window,
     fetch: async () => ({ arrayBuffer: async () => new ArrayBuffer(4) }),
     Image: class { constructor() { images.push(this); } },
     require: name => name === '@capacitor/core'
@@ -44,11 +55,124 @@ function setup({ observeFailure = false } = {}) {
   const plugin = new context.exports.InAppBrowserClass();
   const element = { style: {}, getBoundingClientRect: () => ({ width: 300, height: 400, x: -5, y: 10 }) };
   const open = () => plugin.openWebView({ url: 'https://example.com', element });
-  return { plugin, backend, calls, observers, images, revoked, platform, element, open };
+  const flushLayout = async () => { const pending = [...frames.values()]; frames.clear(); pending.forEach(callback => callback()); await tick(); };
+  return { plugin, backend, calls, observers, images, revoked, platform, element, open, window, frames, flushLayout };
 }
 
 const code = expected => error => error.code === expected;
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test('scroll and viewport events coalesce, preserve CSS fractions and detach cleanly', async () => {
+  const s = setup({ layout: true }); await s.open();
+  s.element.getBoundingClientRect = () => ({ width: 300.25, height: 400.5, x: 11.5, y: 22.75 });
+  s.window.emit('scroll'); s.window.emit('resize'); s.window.visualViewport.emit('scroll');
+  assert.equal(s.frames.size, 1);
+  await s.flushLayout();
+  let updates = s.calls.filter(call => call[0] === 'updateDimensions');
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0][1].x, 11.5); assert.equal(updates[0][1].width, 300.25);
+  s.window.emit('scroll'); await s.flushLayout();
+  assert.equal(s.calls.filter(call => call[0] === 'updateDimensions').length, 1);
+  s.window.visualViewport.height = 300; s.window.visualViewport.offsetTop = 20;
+  s.window.visualViewport.emit('resize'); await s.flushLayout();
+  updates = s.calls.filter(call => call[0] === 'updateDimensions');
+  assert.equal(updates.at(-1)[1].viewportHeight, 300); assert.equal(updates.at(-1)[1].offsetTop, 20);
+  s.window.emit('scroll'); await s.plugin.closeWebView();
+  assert.equal(s.frames.size, 0); assert.equal(s.window.listeners.size, 0);
+  assert.equal(s.window.visualViewport.listeners.size, 0);
+});
+
+test('detached, zero size and offscreen containers hide without invalid dimension updates', async () => {
+  const s = setup({ layout: true }); await s.open();
+  s.element.isConnected = false; s.window.emit('scroll'); await s.flushLayout();
+  assert.equal(s.calls.at(-1)[0], 'setLayoutVisibility'); assert.equal(s.calls.at(-1)[1].visible, false);
+  await assert.rejects(s.plugin.captureScreen(true), code('NOT_VISIBLE'));
+  s.element.isConnected = true;
+  s.element.getBoundingClientRect = () => ({ width: 0, height: 0, x: 0, y: 0 });
+  s.window.emit('resize'); await s.flushLayout();
+  assert.equal(s.calls.filter(call => call[0] === 'updateDimensions').length, 0);
+  s.element.getBoundingClientRect = () => ({ width: 100, height: 100, x: 0, y: 900 });
+  s.window.emit('scroll'); await s.flushLayout();
+  s.element.getBoundingClientRect = () => ({ width: 100, height: 100, x: 0, y: 10 });
+  s.window.emit('scroll'); await s.flushLayout();
+  assert.equal(s.calls.at(-1)[1].visible, true);
+  await s.plugin.closeWebView();
+});
+
+test('automatic geometry updates serialize and deliver the latest position', async () => {
+  const s = setup({ layout: true }); await s.open();
+  const pending = deferred(); let active = 0, peak = 0, count = 0;
+  s.backend.updateDimensions = async () => { peak = Math.max(peak, ++active); if (++count === 1) await pending.promise; active--; };
+  s.element.getBoundingClientRect = () => ({ width: 100, height: 100, x: count ? 50 : 20, y: 10 });
+  s.window.emit('scroll'); await s.flushLayout();
+  s.window.emit('scroll'); await s.flushLayout();
+  pending.resolve(); await tick();
+  assert.equal(count, 2); assert.equal(peak, 1);
+  await s.plugin.closeWebView();
+});
+
+test('snapshot release never captures again and restores owned background styles', async () => {
+  const s = setup(); s.element.style.backgroundImage = 'linear-gradient(red, blue)';
+  s.element.style.backgroundSize = 'cover'; await s.open();
+  const capturing = s.plugin.captureScreen(true); await tick(); s.images[0].onload(); await capturing;
+  await s.plugin.captureScreen(true);
+  assert.equal(s.calls.filter(call => call[0] === 'captureScreen').length, 1);
+  s.element.style.backgroundRepeat = 'repeat-x';
+  await s.plugin.captureScreen(false);
+  assert.equal(s.calls.filter(call => call[0] === 'captureScreen').length, 1);
+  assert.equal(s.element.style.backgroundImage, 'linear-gradient(red, blue)');
+  assert.equal(s.element.style.backgroundSize, 'cover'); assert.equal(s.element.style.backgroundRepeat, 'repeat-x');
+  assert.equal(s.revoked.length, 1);
+  await s.plugin.closeWebView(); assert.equal(s.revoked.length, 1);
+});
+
+test('manual hiding during decode cannot install a snapshot or reveal a hidden browser', async () => {
+  const s = setup(); await s.open();
+  const capture = assert.rejects(s.plugin.captureScreen(true), code('NOT_VISIBLE'));
+  await tick(); await s.plugin.hideWebView(); s.images[0].onload(); await capture;
+  assert.equal(s.calls.filter(call => call[0] === 'setSnapshotMode').length, 0);
+  assert.equal(s.revoked.length, 1);
+  await assert.rejects(s.plugin.captureScreen(true), code('NOT_VISIBLE'));
+  await s.plugin.showWebView(); await s.plugin.closeWebView();
+});
+
+test('headers reject case duplicates and controls before native allocation', async () => {
+  for (const headers of [{ Authorization: 'a', authorization: 'b' }, { Test: 'a\u0000b' }, { Test: 'a\u007fb' }]) {
+    const s = setup();
+    await assert.rejects(s.plugin.openWebView({ url: 'https://example.com', element: s.element, headers }), code('INVALID_ARGUMENT'));
+    assert.equal(s.calls.length, 0);
+  }
+});
+
+test('a page load invalidates the displayed snapshot and releases its URL', async () => {
+  const s = setup(); let loading;
+  s.backend.addListener = async (name, callback) => { if (name === 'pageLoaded') loading = callback; return { remove: async () => {} }; };
+  await s.open();
+  const capture = s.plugin.captureScreen(true); await tick(); s.images[0].onload(); await capture;
+  loading({ isLoading: true });
+  assert.equal(s.revoked.length, 1); assert.equal(s.element.style.backgroundImage, '');
+  await s.plugin.closeWebView(); assert.equal(s.revoked.length, 1);
+});
+
+test('showing during screenshot decode cancels the stale snapshot', async () => {
+  const s = setup(); await s.open();
+  const capture = assert.rejects(s.plugin.captureScreen(true), code('CANCELLED'));
+  await tick(); await s.plugin.showWebView(); s.images[0].onload(); await capture;
+  assert.equal(s.calls.filter(call => call[0] === 'setSnapshotMode').length, 0);
+  assert.equal(s.revoked.length, 1); await s.plugin.closeWebView();
+});
+
+test('a page change during the native snapshot switch restores live mode', async () => {
+  const s = setup(); let loading;
+  s.backend.addListener = async (name, callback) => { if (name === 'pageLoaded') loading = callback; return { remove: async () => {} }; };
+  const modes = [];
+  s.backend.setSnapshotMode = async ({ enabled }) => { modes.push(enabled); if (enabled) loading({ isLoading: true }); };
+  await s.open();
+  const capture = assert.rejects(s.plugin.captureScreen(true), code('CANCELLED'));
+  await tick(); s.images[0].onload(); await capture;
+  assert.deepEqual(modes, [true, false]); assert.equal(s.revoked.length, 1);
+  await s.plugin.closeWebView();
+});
 
 test('all view commands reject before open; repeated close succeeds', async () => {
   const { plugin, calls } = setup();
@@ -202,7 +326,7 @@ test('screenshot promise waits for image decoding and native visibility; URL is 
   const { plugin, backend, images, revoked, open } = setup();
   await open();
   const visibility = deferred();
-  backend.hideWebView = () => visibility.promise;
+  backend.setSnapshotMode = () => visibility.promise;
   let settled = false;
   const snapshot = plugin.captureScreen(true).then(() => { settled = true; });
   await tick();

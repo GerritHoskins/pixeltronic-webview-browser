@@ -52,7 +52,7 @@ public class BrowserNavigationDeviceTest {
         @Override protected void attachWebView(WebView view, InAppBrowserOptions.Bounds bounds) {
             root.addView(view, new FrameLayout.LayoutParams(300, 400)); view.layout(0, 0, 300, 400);
         }
-        @Override protected void loadingEvent() {}
+        @Override protected void loadingEvent() { updateVisibility(); }
         @Override protected void emitLoadError(int code) {}
         @Override protected void emitBrowserClosed(String reason) { assertMain(); closures.add(reason); }
         @Override protected void emitNavigation(String url, boolean popup, boolean mainFrame, NavigationPolicy.Decision decision) {
@@ -62,7 +62,10 @@ public class BrowserNavigationDeviceTest {
 
     private static final class Request {
         final String method, path, body;
-        Request(String method, String path, String body) { this.method = method; this.path = path; this.body = body; }
+        final java.util.Map<String, String> headers;
+        Request(String method, String path, String body, java.util.Map<String, String> headers) {
+            this.method = method; this.path = path; this.body = body; this.headers = headers;
+        }
     }
 
     /** An isolated loopback fixture: no public network endpoints or external services. */
@@ -94,11 +97,16 @@ public class BrowserNavigationDeviceTest {
                 String[] lines = header.toString(StandardCharsets.US_ASCII.name()).split("\r\n");
                 String[] first = lines[0].split(" ");
                 int length = 0;
+                java.util.Map<String, String> requestHeaders = new java.util.HashMap<>();
+                for (String line : lines) {
+                    int colon = line.indexOf(':');
+                    if (colon > 0) requestHeaders.put(line.substring(0, colon).toLowerCase(java.util.Locale.ROOT), line.substring(colon + 1).trim());
+                }
                 for (String line : lines) if (line.toLowerCase(java.util.Locale.ROOT).startsWith("content-length:")) length = Integer.parseInt(line.substring(15).trim());
                 if (length < 0 || length > 16384) return;
                 byte[] body = new byte[length]; int read = 0;
                 while (read < length) { int count = input.read(body, read, length - read); if (count < 0) return; read += count; }
-                Request request = new Request(first[0], first[1], new String(body, StandardCharsets.UTF_8));
+                Request request = new Request(first[0], first[1], new String(body, StandardCharsets.UTF_8), requestHeaders);
                 requests.add(request); received.add(request);
                 String location = request.path.equals("/redirect") ? "/done" :
                     request.path.equals("/blocked-redirect") ? otherOrigin() + "/denied" :
@@ -143,6 +151,29 @@ public class BrowserNavigationDeviceTest {
                 Call load = new Call(new JSObject().put("url", server.origin() + "/redirect"));
                 plugin.loadUrl(load); load.await(); assertNull(load.error);
                 assertEquals("GET", server.awaitPath("/done").method);
+            } finally { dispose(plugin); }
+        }
+    }
+
+    @Test public void firstRequestAndExplicitSameOriginLoadsReceiveHeadersButOtherOriginsDoNot() throws Exception {
+        try (Server server = new Server()) {
+            Harness plugin = harness();
+            try {
+                org.json.JSONArray origins = new org.json.JSONArray().put(server.origin()).put(server.otherOrigin());
+                Call first = new Call(new JSObject().put("url", server.origin() + "/first").put("width", 300).put("height", 400).put("x", 0).put("y", 0)
+                    .put("headers", new JSObject().put("Authorization", "fixture-token").put("User-Agent", "Phase3-Fixture"))
+                    .put("navigationPolicy", new JSObject().put("allowHttp", true).put("allowedOrigins", origins)));
+                plugin.openWebView(first); first.await(); assertNull(first.error);
+                Request request = server.awaitPath("/first");
+                assertEquals("fixture-token", request.headers.get("authorization"));
+                assertEquals("Phase3-Fixture", request.headers.get("user-agent"));
+                Call same = new Call(new JSObject().put("url", server.origin() + "/same"));
+                plugin.loadUrl(same); same.await(); assertNull(same.error);
+                assertEquals("fixture-token", server.awaitPath("/same").headers.get("authorization"));
+                Call other = new Call(new JSObject().put("url", server.otherOrigin() + "/other"));
+                plugin.loadUrl(other); other.await(); assertNull(other.error);
+                request = server.awaitPath("/other");
+                assertNull(request.headers.get("authorization")); assertEquals("Phase3-Fixture", request.headers.get("user-agent"));
             } finally { dispose(plugin); }
         }
     }

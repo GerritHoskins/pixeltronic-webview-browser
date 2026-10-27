@@ -80,6 +80,8 @@ export interface NativeInterface {
   onNavigation(options?: { allow: boolean }): Promise<void>;
   updateDimensions(options?: Dimensions): Promise<void>;
   captureScreen(options?: Dimensions): Promise<ScreenShot>;
+  setLayoutVisibility(options: { visible: boolean }): Promise<void>;
+  setSnapshotMode(options: { enabled: boolean }): Promise<void>;
   addListener(
     eventName: EventListeners | 'browserClosed',
     listenerFunc: (...args: any[]) => void,
@@ -96,7 +98,9 @@ export interface OpenOptions extends Dimensions {
    */
   element?: HTMLElement;
   /**
-   * Request headers
+   * Headers for programmatic open/loadUrl requests to the initial origin.
+   * User-Agent applies to the WebView session. Native redirects and subresources
+   * are managed by the platform; this is not a guarantee of per-request headers.
    */
   headers?: Headers;
   /**
@@ -155,6 +159,11 @@ export interface Dimensions {
   x?: number;
   y?: number;
   ratio?: number;
+  /** Visual viewport metadata supplied by the wrapper for CSS-to-native conversion. */
+  viewportWidth?: number;
+  viewportHeight?: number;
+  offsetLeft?: number;
+  offsetTop?: number;
 }
 export interface Headers {
   [key: string]: string;

@@ -62,9 +62,64 @@ enum BrowserInput {
         guard let raw = call.options["headers"] else { return [:] }
         guard let headers = raw as? [String: String], headers.allSatisfy({ name, value in
             name.range(of: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$", options: .regularExpression) != nil &&
-                !value.contains("\r") && !value.contains("\n")
+                !value.unicodeScalars.contains { ($0.value < 32 && $0.value != 9) || $0.value == 127 }
         }) else { throw BrowserInputError(message: "Invalid header names or values.") }
+        guard Set(headers.keys.map { $0.lowercased() }).count == headers.count else {
+            throw BrowserInputError(message: "Duplicate header names are not allowed.")
+        }
         return headers
+    }
+
+    static func layout(_ call: CAPPluginCall) throws -> BrowserLayout {
+        let rect = try bounds(call)
+        func optional(_ key: String, positive: Bool = false) throws -> CGFloat? {
+            guard let raw = call.options[key] else { return nil }
+            guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+                  value.doubleValue.isFinite, !positive || value.doubleValue > 0 else {
+                throw BrowserInputError(message: "Invalid viewport geometry.")
+            }
+            return CGFloat(value.doubleValue)
+        }
+        return BrowserLayout(rect: rect, viewportWidth: try optional("viewportWidth", positive: true),
+                             viewportHeight: try optional("viewportHeight", positive: true),
+                             offset: CGPoint(x: try optional("offsetLeft") ?? 0, y: try optional("offsetTop") ?? 0))
+    }
+
+    static func boolean(_ call: CAPPluginCall, _ key: String) throws -> Bool {
+        guard let value = call.options[key] as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
+            throw BrowserInputError(message: "A boolean value is required.")
+        }
+        return value.boolValue
+    }
+}
+
+struct BrowserLayout {
+    let rect: CGRect
+    var viewportWidth: CGFloat?
+    var viewportHeight: CGFloat?
+    var offset: CGPoint = .zero
+
+    func project(host: CGSize) throws -> (frame: CGRect, clip: CGSize) {
+        let scale = viewportWidth.map { host.width / $0 } ?? 1
+        let frame = CGRect(x: (rect.minX - offset.x) * scale, y: (rect.minY - offset.y) * scale,
+                           width: rect.width * scale, height: rect.height * scale)
+        guard scale.isFinite, scale > 0,
+              [frame.origin.x, frame.origin.y, frame.width, frame.height].allSatisfy({ $0.isFinite && abs($0) <= CGFloat(Int32.max) }) else {
+            throw BrowserInputError(message: "Bounds exceed the native coordinate range.")
+        }
+        return (frame, CGSize(width: host.width, height: min(host.height, viewportHeight.map { $0 * scale } ?? host.height)))
+    }
+}
+
+enum BrowserRequest {
+    static func make(_ url: URL, initialURL: URL, headers: [String: String]) -> URLRequest {
+        var request = URLRequest(url: url)
+        if let origin = BrowserNavigationPolicy.origin(initialURL), origin == BrowserNavigationPolicy.origin(url) {
+            for (name, value) in headers where name.lowercased() != "user-agent" {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
+        }
+        return request
     }
 }
 
@@ -149,6 +204,8 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "closeWebView", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "showWebView", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "hideWebView", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setLayoutVisibility", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setSnapshotMode", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "navigateBack", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "navigateForward", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "refresh", returnType: CAPPluginReturnPromise),
@@ -179,6 +236,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         parent.addChild(browser)
         browser.view.frame = bounds
         parent.view.addSubview(browser.view)
+        if let host = bridge?.webView { browser.trackHost(host) }
         browser.didMove(toParent: parent)
     }
 
@@ -208,7 +266,8 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     @objc func openWebView(_ call: CAPPluginCall) {
         execute(call) { response in
             let url = try BrowserInput.url(call)
-            let bounds = try BrowserInput.bounds(call)
+            let layout = try BrowserInput.layout(call)
+            let bounds = layout.rect
             let headers = try BrowserInput.headers(call)
             let policy = try BrowserNavigationPolicy.from(call, initialURL: url)
             let decision = policy.evaluate(url)
@@ -216,7 +275,12 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             guard self.inAppBrowser == nil else { response.reject("BUSY", "Close the existing WebView before opening another."); return }
             let browser = self.makeBrowser(headers: headers, policy: policy)
             self.inAppBrowser = browser
-            do { try self.attachBrowser(browser, bounds: bounds) }
+            browser.initialURL = url
+            browser.layout = layout
+            do {
+                try self.attachBrowser(browser, bounds: bounds)
+                try browser.applyLayout()
+            }
             catch {
                 self.closeInternal("NATIVE_ERROR", "Could not attach the WebView.")
                 response.reject("NATIVE_ERROR", "Could not attach the WebView.")
@@ -235,11 +299,25 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func showWebView(_ call: CAPPluginCall) {
-        withBrowser(call) { browser, response in browser.hidden = false; browser.updateVisibility(); response.resolve() }
+        withBrowser(call) { browser, response in browser.hidden = false; browser.snapshotMode = false; browser.updateVisibility(); response.resolve() }
     }
 
     @objc func hideWebView(_ call: CAPPluginCall) {
-        withBrowser(call) { browser, response in browser.hidden = true; browser.updateVisibility(); response.resolve() }
+        withBrowser(call) { browser, response in browser.hidden = true; browser.snapshotMode = false; browser.updateVisibility(); response.resolve() }
+    }
+
+    @objc func setLayoutVisibility(_ call: CAPPluginCall) {
+        withBrowser(call) { browser, response in
+            browser.layoutVisible = try BrowserInput.boolean(call, "visible")
+            browser.updateVisibility(); response.resolve()
+        }
+    }
+
+    @objc func setSnapshotMode(_ call: CAPPluginCall) {
+        withBrowser(call) { browser, response in
+            browser.snapshotMode = try BrowserInput.boolean(call, "enabled")
+            browser.updateVisibility(); response.resolve()
+        }
     }
 
     @objc func navigateBack(_ call: CAPPluginCall) {
@@ -271,7 +349,13 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func updateDimensions(_ call: CAPPluginCall) {
-        withBrowser(call) { browser, response in browser.view.frame = try BrowserInput.bounds(call); response.resolve() }
+        withBrowser(call) { browser, response in
+            let previous = browser.layout
+            browser.layout = try BrowserInput.layout(call)
+            do { try browser.applyLayout() }
+            catch { browser.layout = previous; throw error }
+            response.resolve()
+        }
     }
 
     @objc func onNavigation(_ call: CAPPluginCall) {
@@ -340,7 +424,11 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     @objc func captureScreen(_ call: CAPPluginCall) {
         withBrowser(call, idle: true) { browser, response in
             guard self.captures.isEmpty else { response.reject("BUSY", "A screenshot is in progress."); return }
-            guard browser.view.bounds.width > 0, browser.view.bounds.height > 0 else {
+            guard !browser.loading else { response.reject("BUSY", "The page is loading."); return }
+            guard browser.captureVisible else {
+                response.reject("NOT_VISIBLE", "The WebView is hidden."); return
+            }
+            guard let webview = browser.webview, webview.bounds.width > 0, webview.bounds.height > 0 else {
                 response.reject("INVALID_ARGUMENT", "The WebView has no drawable bounds."); return
             }
             let id = UUID()
@@ -359,7 +447,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                     var encoded: String?
                     if let data = CFDataCreateMutable(nil, 0),
                        let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) {
-                        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 1] as CFDictionary)
+                        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
                         if CGImageDestinationFinalize(destination) { encoded = (data as Data).base64EncodedString() }
                     }
                     let result = encoded

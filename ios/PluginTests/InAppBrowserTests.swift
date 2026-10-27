@@ -99,6 +99,68 @@ final class InAppBrowserTests: XCTestCase {
         XCTAssertEqual(close.successes, 2); XCTAssertTrue(close.errors.isEmpty)
     }
 
+    func testManualLayoutAndSnapshotVisibilityRemainIndependent() async {
+        let plugin = PluginHarness()
+        _ = await open(plugin); finish(plugin)
+        guard let browser = plugin.browser else { XCTFail("No browser"); return }
+        let hide = Record(); plugin.hideWebView(hide.call()); await drain()
+        browser.sendLoadingEvent(true); browser.sendLoadingEvent(false)
+        XCTAssertTrue(browser.view.isHidden)
+        let capture = Record(); plugin.captureScreen(capture.call()); await drain()
+        XCTAssertEqual(capture.errors, ["NOT_VISIBLE"])
+        let show = Record(); plugin.showWebView(show.call()); await drain()
+        browser.layoutVisible = false; browser.snapshotMode = true; browser.updateVisibility()
+        let restore = Record(); plugin.setSnapshotMode(restore.call(["enabled": false])); await drain()
+        XCTAssertTrue(browser.view.isHidden)
+        let layout = Record(); plugin.setLayoutVisibility(layout.call(["visible": true])); await drain()
+        XCTAssertFalse(browser.view.isHidden)
+        plugin.tearDownBrowser()
+    }
+
+    func testViewportProjectionUsesOneScaleAndKeyboardClip() throws {
+        let layout = BrowserLayout(rect: CGRect(x: 15.5, y: 30.25, width: 300.25, height: 400.5),
+                                   viewportWidth: 400, viewportHeight: 250, offset: CGPoint(x: 5, y: 20))
+        let projected = try layout.project(host: CGSize(width: 1200, height: 2400))
+        XCTAssertEqual(projected.frame, CGRect(x: 31.5, y: 30.75, width: 900.75, height: 1201.5))
+        XCTAssertEqual(projected.clip, CGSize(width: 1200, height: 750))
+    }
+
+    func testRequestHeadersOnlyAttachToInitialOrigin() {
+        let initial = URL(string: "https://example.com/start")!
+        let headers = ["Authorization": "fixture-token", "User-Agent": "fixture-agent"]
+        let same = BrowserRequest.make(URL(string: "https://EXAMPLE.com:443/next")!, initialURL: initial, headers: headers)
+        XCTAssertEqual(same.value(forHTTPHeaderField: "Authorization"), "fixture-token")
+        XCTAssertNil(same.value(forHTTPHeaderField: "User-Agent"))
+        let other = BrowserRequest.make(URL(string: "https://login.example.com")!, initialURL: initial, headers: headers)
+        XCTAssertNil(other.value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testProjectionRejectsFiniteValuesThatOverflowNativeGeometry() {
+        let layout = BrowserLayout(rect: CGRect(x: 0, y: 0, width: Double.greatestFiniteMagnitude, height: 1), viewportWidth: 1)
+        XCTAssertThrowsError(try layout.project(host: CGSize(width: 1000, height: 2000)))
+    }
+
+    func testClippingSurfacePassesTouchesOutsideBrowserToHost() async {
+        let plugin = PluginHarness(); _ = await open(plugin); finish(plugin)
+        guard let browser = plugin.browser else { XCTFail("No browser"); return }
+        browser.view.frame = CGRect(x: 0, y: 0, width: 400, height: 800)
+        browser.webview?.frame = CGRect(x: 20, y: 30, width: 100, height: 100)
+        XCTAssertNil(browser.view.hitTest(CGPoint(x: 300, y: 500), with: nil))
+        XCTAssertNotNil(browser.view.hitTest(CGPoint(x: 50, y: 50), with: nil))
+        plugin.tearDownBrowser()
+    }
+
+    func testMalformedViewportAndDuplicateHeadersReject() {
+        let record = Record()
+        for viewport in [0, -1, true, "bad", Double.infinity] as [Any] {
+            var value = options; value["viewportWidth"] = viewport
+            XCTAssertThrowsError(try BrowserInput.layout(record.call(value)))
+        }
+        for headers in [["Authorization": "a", "authorization": "b"], ["Test": "a\u{0}b"], ["Test": "a\u{7f}b"]] {
+            XCTAssertThrowsError(try BrowserInput.headers(record.call(["headers": headers])))
+        }
+    }
+
     func testMalformedInputsDoNotCreateAView() async {
         let plugin = PluginHarness()
         let invalidInputs: [[String: Any]] = [["url": "relative"], ["url": "https://"], ["width": 0],

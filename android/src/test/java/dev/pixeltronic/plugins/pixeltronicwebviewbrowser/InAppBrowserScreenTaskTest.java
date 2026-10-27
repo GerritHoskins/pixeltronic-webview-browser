@@ -11,7 +11,7 @@ import org.junit.Test;
 public class InAppBrowserScreenTaskTest {
     @Test public void workerEncodesAnAlreadyCapturedBitmapAndReleasesIt() throws Exception {
         Bitmap bitmap = mock(Bitmap.class);
-        when(bitmap.compress(any(), eq(100), any())).thenAnswer(invocation -> {
+        when(bitmap.compress(any(), eq(85), any())).thenAnswer(invocation -> {
             ((OutputStream) invocation.getArgument(2)).write(new byte[] {1, 2, 3}); return true;
         });
         AtomicReference<byte[]> bytes = new AtomicReference<>();

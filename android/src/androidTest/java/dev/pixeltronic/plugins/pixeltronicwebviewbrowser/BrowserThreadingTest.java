@@ -52,6 +52,7 @@ public class BrowserThreadingTest {
         boolean disposed;
         CheckingWebView(Context context) { super(context); }
         @Override public void loadUrl(String url) { assertMain(); /* No network: completion is driven by the test. */ }
+        @Override public void loadUrl(String url, java.util.Map<String, String> headers) { assertMain(); }
         @Override public void draw(Canvas canvas) { assertMain(); draws++; super.draw(canvas); }
         @Override public void stopLoading() { assertMain(); super.stopLoading(); }
         @Override public void destroy() { assertMain(); disposed = true; super.destroy(); }
@@ -68,7 +69,7 @@ public class BrowserThreadingTest {
             root.addView(view, new FrameLayout.LayoutParams(300, 400));
             view.layout(0, 0, 300, 400);
         }
-        @Override protected void loadingEvent() {}
+        @Override protected void loadingEvent() { updateVisibility(); }
         @Override protected void emitLoadError(int code) {}
         @Override protected void emitNavigation(String url, boolean popup, boolean mainFrame, NavigationPolicy.Decision decision) {}
         @Override protected void emitBrowserClosed(String reason) {}
@@ -87,6 +88,41 @@ public class BrowserThreadingTest {
     private void finishOpen(Harness plugin) {
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
         InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> plugin.view.getWebViewClient().onPageFinished(plugin.view, URL));
+    }
+
+    @Test public void manualLayoutAndSnapshotVisibilityRemainIndependentAcrossLoading() throws Exception {
+        Harness plugin = harness();
+        try {
+            RecordingCall open = openCall(); plugin.openWebView(open); finishOpen(plugin); open.awaitResult();
+            RecordingCall hide = new RecordingCall(new JSObject()); plugin.hideWebView(hide); hide.awaitResult();
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+                plugin.view.getWebViewClient().onPageStarted(plugin.view, URL, null);
+                plugin.view.getWebViewClient().onPageFinished(plugin.view, URL);
+                assertEquals(android.view.View.INVISIBLE, plugin.view.getVisibility());
+            });
+            RecordingCall capture = new RecordingCall(new JSObject()); plugin.captureScreen(capture); capture.awaitResult();
+            assertEquals("NOT_VISIBLE", capture.error);
+            RecordingCall show = new RecordingCall(new JSObject()); plugin.showWebView(show); show.awaitResult();
+            RecordingCall layout = new RecordingCall(new JSObject().put("visible", false)); plugin.setLayoutVisibility(layout); layout.awaitResult();
+            RecordingCall snapshot = new RecordingCall(new JSObject().put("enabled", false)); plugin.setSnapshotMode(snapshot); snapshot.awaitResult();
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> assertEquals(android.view.View.INVISIBLE, plugin.view.getVisibility()));
+            RecordingCall restore = new RecordingCall(new JSObject().put("visible", true)); plugin.setLayoutVisibility(restore); restore.awaitResult();
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> assertEquals(android.view.View.VISIBLE, plugin.view.getVisibility()));
+        } finally { plugin.handleOnDestroy(); InstrumentationRegistry.getInstrumentation().waitForIdleSync(); }
+    }
+
+    @Test public void actualCaptureCapsLongestEdgeAndPreservesAspectRatio() throws Exception {
+        Harness plugin = harness();
+        try {
+            RecordingCall open = openCall(); plugin.openWebView(open); finishOpen(plugin); open.awaitResult();
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> plugin.view.layout(0, 0, 3000, 6000));
+            RecordingCall capture = new RecordingCall(new JSObject()); plugin.captureScreen(capture); capture.awaitResult();
+            assertNull(capture.error);
+            byte[] bytes = android.util.Base64.decode(capture.result.getString("src"), android.util.Base64.DEFAULT);
+            android.graphics.BitmapFactory.Options options = new android.graphics.BitmapFactory.Options(); options.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
+            assertEquals(1024, options.outWidth); assertEquals(2048, options.outHeight);
+        } finally { plugin.handleOnDestroy(); InstrumentationRegistry.getInstrumentation().waitForIdleSync(); }
     }
 
     @Test public void actualWebViewCaptureAndDisposalUseMainThread() throws Exception {

@@ -10,6 +10,8 @@ import android.os.Message;
 import android.util.Base64;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
+import android.widget.FrameLayout;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
@@ -48,6 +50,13 @@ public class InAppBrowserPlugin extends Plugin {
     private final Map<CallResult, Runnable> captures = new HashMap<>();
     private ExecutorService encoder;
     private Handler handler;
+    private FrameLayout overlay;
+    private WebView layoutHost;
+    private ViewTreeObserver.OnGlobalLayoutListener layoutListener;
+    private InAppBrowserOptions.Bounds latestBounds;
+    private boolean layoutVisible = true;
+    private boolean snapshotMode;
+    private boolean geometryReady = true;
 
     @PluginMethod
     public void openWebView(PluginCall call) {
@@ -65,6 +74,9 @@ public class InAppBrowserPlugin extends Plugin {
             navigationPolicy = policy;
             initialUrl = url;
             hidden = false;
+            layoutVisible = true;
+            snapshotMode = false;
+            geometryReady = true;
             opening = true;
             openingOwner = result;
             configureWebSettings(view);
@@ -73,8 +85,7 @@ public class InAppBrowserPlugin extends Plugin {
             attachWebView(view, bounds);
             beginLoad(result);
             emitNavigation(url, false, true, decision);
-            // Header behavior is unchanged in Stage 1; policy/parity is handled separately.
-            view.loadUrl(url);
+            loadUrlWithHeaders(view, url);
         });
     }
 
@@ -92,8 +103,24 @@ public class InAppBrowserPlugin extends Plugin {
         });
     }
 
-    @PluginMethod public void showWebView(PluginCall call) { withView(call, false, (view, result) -> { hidden = false; updateVisibility(); result.resolve(); }); }
-    @PluginMethod public void hideWebView(PluginCall call) { withView(call, false, (view, result) -> { hidden = true; updateVisibility(); result.resolve(); }); }
+    @PluginMethod public void showWebView(PluginCall call) { withView(call, false, (view, result) -> { hidden = false; snapshotMode = false; updateVisibility(); result.resolve(); }); }
+    @PluginMethod public void hideWebView(PluginCall call) { withView(call, false, (view, result) -> { hidden = true; snapshotMode = false; updateVisibility(); result.resolve(); }); }
+
+    @PluginMethod public void setLayoutVisibility(PluginCall call) {
+        withView(call, false, (view, result) -> {
+            Boolean visible = call.getBoolean("visible");
+            if (visible == null) throw new IllegalArgumentException("A boolean visible value is required.");
+            layoutVisible = visible; updateVisibility(); result.resolve();
+        });
+    }
+
+    @PluginMethod public void setSnapshotMode(PluginCall call) {
+        withView(call, false, (view, result) -> {
+            Boolean enabled = call.getBoolean("enabled");
+            if (enabled == null) throw new IllegalArgumentException("A boolean enabled value is required.");
+            snapshotMode = enabled; updateVisibility(); result.resolve();
+        });
+    }
     @PluginMethod public void navigateBack(PluginCall call) { withView(call, true, (view, result) -> { if (view.canGoBack()) view.goBack(); result.resolve(); }); }
     @PluginMethod public void navigateForward(PluginCall call) { withView(call, true, (view, result) -> { if (view.canGoForward()) view.goForward(); result.resolve(); }); }
     @PluginMethod public void refresh(PluginCall call) { withView(call, true, (view, result) -> { view.reload(); result.resolve(); }); }
@@ -131,10 +158,15 @@ public class InAppBrowserPlugin extends Plugin {
     public void captureScreen(PluginCall call) {
         withView(call, true, (view, result) -> {
             if (!captures.isEmpty()) { result.reject("BUSY", "A screenshot is already in progress."); return; }
+            if (loading) { result.reject("BUSY", "The page is loading."); return; }
+            if (hidden || snapshotMode || !layoutVisible || !geometryReady) { result.reject("NOT_VISIBLE", "The WebView is hidden."); return; }
             if (view.getWidth() <= 0 || view.getHeight() <= 0) throw new IllegalArgumentException("The WebView has no drawable bounds.");
-            Bitmap bitmap = Bitmap.createBitmap(view.getWidth(), view.getHeight(), Bitmap.Config.ARGB_8888);
+            int[] size = BrowserGeometry.snapshotSize(view.getWidth(), view.getHeight());
+            Bitmap bitmap = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888);
             try {
-                view.draw(new Canvas(bitmap));
+                Canvas canvas = new Canvas(bitmap);
+                canvas.scale(size[0] / (float) view.getWidth(), size[1] / (float) view.getHeight());
+                view.draw(canvas);
             } catch (RuntimeException ex) {
                 bitmap.recycle();
                 throw ex;
@@ -192,29 +224,59 @@ public class InAppBrowserPlugin extends Plugin {
     protected void postTimeout(Runnable runnable) { if (handler == null) handler = new Handler(Looper.getMainLooper()); handler.postDelayed(runnable, TIMEOUT_MS); }
     protected void cancelTimeout(Runnable runnable) { if (handler != null && runnable != null) handler.removeCallbacks(runnable); }
     protected WebView createWebView() { return new WebView(getContext()); }
+    protected WebView hostWebView() { return getBridge().getWebView(); }
 
     protected void attachWebView(WebView view, InAppBrowserOptions.Bounds bounds) {
-        ViewGroup parent = (ViewGroup) getBridge().getWebView().getParent();
-        parent.addView(view, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        layoutHost = hostWebView();
+        ViewGroup parent = (ViewGroup) layoutHost.getParent();
+        overlay = new FrameLayout(view.getContext());
+        overlay.setClipChildren(true); overlay.setClipToPadding(true);
+        parent.addView(overlay, new ViewGroup.LayoutParams(1, 1));
+        overlay.addView(view, new FrameLayout.LayoutParams(1, 1));
         applyBounds(view, bounds);
+        layoutListener = () -> {
+            if (webView != view || latestBounds == null) return;
+            try { applyBounds(view, latestBounds); }
+            catch (IllegalArgumentException ex) { geometryReady = false; updateVisibility(); }
+        };
+        layoutHost.getViewTreeObserver().addOnGlobalLayoutListener(layoutListener);
     }
 
     private void applyBounds(WebView view, InAppBrowserOptions.Bounds bounds) {
-        float density = view.getResources().getDisplayMetrics().density;
-        double scaledWidth = bounds.width * density, scaledHeight = bounds.height * density;
-        if (!Double.isFinite(scaledWidth) || !Double.isFinite(scaledHeight) || scaledWidth > Integer.MAX_VALUE || scaledHeight > Integer.MAX_VALUE ||
-            Math.abs(bounds.x * density) > Integer.MAX_VALUE || Math.abs(bounds.y * density) > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException("Bounds exceed the native coordinate range.");
-        }
+        WebView host = layoutHost == null ? view : layoutHost;
+        if (host.getWidth() <= 0 || host.getHeight() <= 0) { latestBounds = bounds; geometryReady = false; updateVisibility(); return; }
+        BrowserGeometry.Frame frame = BrowserGeometry.project(bounds, host.getWidth(), host.getHeight(), view.getResources().getDisplayMetrics().density);
+        latestBounds = bounds;
+        boolean changed = false;
         ViewGroup.LayoutParams params = view.getLayoutParams();
-        params.width = Math.max(1, (int) Math.round(scaledWidth));
-        params.height = Math.max(1, (int) Math.round(scaledHeight));
-        view.setLayoutParams(params);
-        view.setX((float) (bounds.x * density));
-        view.setY((float) (bounds.y * density));
+        if (params.width != frame.width || params.height != frame.height) {
+            params.width = frame.width; params.height = frame.height;
+            view.setLayoutParams(params); changed = true;
+        }
+        if (view.getX() != frame.x) { view.setX(frame.x); changed = true; }
+        if (view.getY() != frame.y) { view.setY(frame.y); changed = true; }
+        if (overlay != null) {
+            ViewGroup.LayoutParams clip = overlay.getLayoutParams();
+            if (clip.width != frame.clipWidth || clip.height != frame.clipHeight) {
+                clip.width = frame.clipWidth; clip.height = frame.clipHeight;
+                overlay.setLayoutParams(clip); changed = true;
+            }
+            if (overlay.getX() != host.getX()) { overlay.setX(host.getX()); changed = true; }
+            if (overlay.getY() != host.getY()) { overlay.setY(host.getY()); changed = true; }
+        }
+        geometryReady = true;
+        updateVisibility();
+        if (changed) emitDimensions(bounds);
+    }
+
+    protected void emitDimensions(InAppBrowserOptions.Bounds bounds) {
+        notifyListeners("updateDimensions", new JSObject().put("width", bounds.width).put("height", bounds.height).put("x", bounds.x).put("y", bounds.y));
     }
 
     private void beginLoad(CallResult result) {
+        loading = true;
+        snapshotMode = false;
+        updateVisibility();
         pendingLoad = result;
         loadTimeout = () -> {
             if (pendingLoad != result) return;
@@ -242,11 +304,21 @@ public class InAppBrowserPlugin extends Plugin {
             entry.getKey().reject(code, message);
         }
         captures.clear();
+        if (layoutHost != null && layoutListener != null && layoutHost.getViewTreeObserver().isAlive()) {
+            layoutHost.getViewTreeObserver().removeOnGlobalLayoutListener(layoutListener);
+        }
+        layoutListener = null; layoutHost = null; latestBounds = null;
+        if (overlay != null) {
+            overlay.removeAllViews();
+            if (overlay.getParent() instanceof ViewGroup) ((ViewGroup) overlay.getParent()).removeView(overlay);
+            overlay = null;
+        }
         headers = new HashMap<>();
         navigationPolicy = null;
         initialUrl = null;
         hidden = false;
         loading = false;
+        snapshotMode = false; layoutVisible = true; geometryReady = true;
         if (view != null) {
             view.stopLoading();
             view.setWebViewClient(null);
@@ -270,11 +342,10 @@ public class InAppBrowserPlugin extends Plugin {
     }
 
     private void loadUrlWithHeaders(WebView view, String url) {
-        Map<String, String> requestHeaders = new HashMap<>();
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             if (entry.getKey().equalsIgnoreCase("User-Agent")) view.getSettings().setUserAgentString(entry.getValue());
-            else requestHeaders.put(entry.getKey(), entry.getValue());
         }
+        Map<String, String> requestHeaders = InAppBrowserOptions.requestHeaders(headers, initialUrl, url);
         view.loadUrl(url, requestHeaders);
     }
 
@@ -313,6 +384,7 @@ public class InAppBrowserPlugin extends Plugin {
                 NavigationPolicy.Decision decision = policy.evaluate(url);
                 if (!decision.allowed) { blockNavigation(view, url, true, decision, true); return; }
                 loading = true;
+                snapshotMode = false;
                 loadingEvent();
             }
             @Override public void onPageFinished(WebView view, String url) {
@@ -365,7 +437,11 @@ public class InAppBrowserPlugin extends Plugin {
         notifyListeners("pageLoaded", new JSObject().put("isLoading", false), true);
     }
 
-    private void updateVisibility() { if (webView != null) webView.setVisibility(hidden || loading ? View.INVISIBLE : View.VISIBLE); }
+    protected final void updateVisibility() {
+        int visibility = hidden || loading || snapshotMode || !layoutVisible || !geometryReady ? View.INVISIBLE : View.VISIBLE;
+        if (webView != null) webView.setVisibility(visibility);
+        if (overlay != null) overlay.setVisibility(visibility);
+    }
     protected void loadingEvent() { updateVisibility(); notifyListeners("pageLoaded", new JSObject().put("isLoading", loading), true); }
 
     private boolean blockNavigation(WebView view, String url, boolean mainFrame, NavigationPolicy.Decision decision) {

@@ -59,6 +59,7 @@ public class InAppBrowserPluginTest {
 
     private static PluginCall validCall() {
         PluginCall call = mock(PluginCall.class);
+        for (String key : List.of("viewportWidth", "viewportHeight", "offsetLeft", "offsetTop")) when(call.getDouble(key)).thenReturn(null);
         when(call.getString("url")).thenReturn(URL);
         when(call.getDouble("width")).thenReturn(300.0);
         when(call.getDouble("height")).thenReturn(400.0);
@@ -191,7 +192,7 @@ public class InAppBrowserPluginTest {
 
     @Test public void synchronousNativeFailureRejectsAndRollsBack() {
         Harness plugin = new Harness();
-        doThrow(new IllegalStateException()).when(plugin.view).loadUrl(URL);
+        doThrow(new IllegalStateException()).when(plugin.view).loadUrl(eq(URL), anyMap());
         PluginCall call = plugin.open();
         rejected(call, "NATIVE_ERROR"); verify(plugin.view).destroy();
         assertTrue(plugin.timeouts.isEmpty());
@@ -231,7 +232,7 @@ public class InAppBrowserPluginTest {
         assertFalse(plugin.client().shouldOverrideUrlLoading(plugin.view, request(next, true)));
         WebResourceRequest post = request(next, true); when(post.getMethod()).thenReturn("POST");
         assertNull(plugin.client().shouldInterceptRequest(plugin.view, post));
-        verify(plugin.view, times(1)).loadUrl(anyString());
+        verify(plugin.view, times(1)).loadUrl(anyString(), anyMap());
         when(plugin.view.getUrl()).thenReturn(next);
         plugin.client().onPageFinished(plugin.view, next); verify(open).resolve();
     }
@@ -253,7 +254,7 @@ public class InAppBrowserPluginTest {
         when(open.getObject("navigationPolicy")).thenReturn(policy);
         plugin.openWebView(open); plugin.drain();
         assertFalse(plugin.client().shouldOverrideUrlLoading(plugin.view, request("https://login.example.com/login", true)));
-        verify(plugin.view, times(1)).loadUrl(anyString()); plugin.finish(); verify(open).resolve();
+        verify(plugin.view, times(1)).loadUrl(anyString(), anyMap()); plugin.finish(); verify(open).resolve();
     }
 
     @Test public void blockedPostIsInterceptedWithoutTouchingViewsOnTheWorker() throws Exception {

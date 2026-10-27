@@ -20,7 +20,7 @@ final class InAppBrowserScreenTask implements Runnable {
     public void run() {
         byte[] bytes;
         try (ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 100, output)) {
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)) {
                 throw new IllegalStateException("JPEG encoding failed.");
             }
             bytes = output.toByteArray();

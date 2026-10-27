@@ -17,7 +17,11 @@ import type {
 const InAppBrowserPlugin =
   registerPlugin<NativeInterface>('InAppBrowserPlugin');
 type State = 'closed' | 'opening' | 'open' | 'closing' | 'failed';
-type Bounds = Required<Pick<Dimensions, 'width' | 'height' | 'x' | 'y'>>;
+type Bounds = Required<Pick<Dimensions, 'width' | 'height' | 'x' | 'y'>> &
+  Pick<
+    Dimensions,
+    'viewportWidth' | 'viewportHeight' | 'offsetLeft' | 'offsetTop'
+  >;
 
 function failure(code: string, message: string): Error {
   return Object.assign(new Error(message), { code });
@@ -35,6 +39,19 @@ export class InAppBrowserClass implements InAppBrowserInterface {
   private cancelSnapshot?: () => void;
   private capturing = false;
   private navigationPolicy?: Required<NavigationPolicy>;
+  private requestedHidden = false;
+  private layoutVisible = true;
+  private visibilityRevision = 0;
+  private lastBounds?: Bounds;
+  private layoutFrame?: number;
+  private layoutActive = false;
+  private layoutPending = false;
+  private layoutCleanup: (() => void)[] = [];
+  private mutationObserver?: MutationObserver;
+  private snapshotStyles?: Record<
+    string,
+    { original: string; priority: string; applied: string }
+  >;
 
   async openWebView(options: OpenOptions): Promise<void> {
     this.requireNative();
@@ -59,11 +76,14 @@ export class InAppBrowserClass implements InAppBrowserInterface {
     this.validateHeaders(options.headers);
     const bounds = this.getDimensions(options.element);
     this.state = 'opening';
+    this.requestedHidden = false;
+    this.layoutVisible = true;
     this.navigationPolicy = policy;
     this.element = options.element;
     const generation = ++this.generation;
     let nativeOpened = false;
     let lifecycleListener: PluginListenerHandle | undefined;
+    let loadingListener: PluginListenerHandle | undefined;
     try {
       lifecycleListener = await InAppBrowserPlugin.addListener(
         'browserClosed',
@@ -85,6 +105,19 @@ export class InAppBrowserClass implements InAppBrowserInterface {
         throw failure('CANCELLED', 'The WebView was closed while opening.');
       }
       this.listeners.add(lifecycleListener);
+      loadingListener = await InAppBrowserPlugin.addListener(
+        'pageLoaded',
+        status => {
+          if (generation !== this.generation || !status.isLoading) return;
+          ++this.visibilityRevision;
+          this.releaseSnapshot();
+        },
+      );
+      if (generation !== this.generation) {
+        await loadingListener.remove();
+        throw failure('CANCELLED', 'The WebView was closed while opening.');
+      }
+      this.listeners.add(loadingListener);
       await InAppBrowserPlugin.openWebView({
         url: url.href,
         headers: options.headers,
@@ -95,21 +128,19 @@ export class InAppBrowserClass implements InAppBrowserInterface {
       if (generation !== this.generation)
         throw failure('CANCELLED', 'The WebView was closed while opening.');
       this.state = 'open';
-      const element = options.element;
-      this.resizeObserver = new ResizeObserver(() => {
-        if (this.state !== 'open' || generation !== this.generation) return;
-        // Observers cannot return their promise to a caller. Handle failures explicitly.
-        void Promise.resolve()
-          .then(() => this.updateDimensions(this.getDimensions(element)))
-          .catch(error => console.error('WebView resize failed.', error));
-      });
-      this.resizeObserver.observe(element);
+      this.lastBounds = bounds;
+      this.installLayoutTracking(options.element, generation);
+      await this.syncElementLayout(generation);
     } catch (error) {
       if (generation === this.generation) {
         if (nativeOpened) await this.closeWebView();
         else {
           this.state = 'closed';
           this.clearViewResources();
+          if (loadingListener) {
+            this.listeners.delete(loadingListener);
+            await loadingListener.remove();
+          }
           if (lifecycleListener) {
             this.listeners.delete(lifecycleListener);
             await lifecycleListener.remove();
@@ -156,19 +187,19 @@ export class InAppBrowserClass implements InAppBrowserInterface {
   }
 
   async showWebView(): Promise<void> {
-    this.requireOpen();
-    await InAppBrowserPlugin.showWebView();
+    await this.changeVisibility(false);
   }
 
   async hideWebView(): Promise<void> {
-    this.requireOpen();
-    await InAppBrowserPlugin.hideWebView();
+    await this.changeVisibility(true);
   }
 
   async loadUrl(options: { url: string }): Promise<void> {
     this.requireOpen();
     const url = this.validateUrl(options?.url);
     this.enforcePolicy(url, this.navigationPolicy);
+    const resume = this.resumeLiveView();
+    if (resume) await resume;
     const generation = this.generation;
     try {
       await InAppBrowserPlugin.loadUrl({ url: url.href });
@@ -194,25 +225,38 @@ export class InAppBrowserClass implements InAppBrowserInterface {
 
   async reload(): Promise<void> {
     this.requireOpen();
+    const resume = this.resumeLiveView();
+    if (resume) await resume;
     await InAppBrowserPlugin.refresh();
   }
 
   async updateDimensions(dimensions: Dimensions): Promise<void> {
     this.requireOpen();
-    const bounds = this.validateBounds(dimensions);
+    const bounds =
+      dimensions === undefined
+        ? this.getDimensions(this.element)
+        : this.validateBounds({ ...this.viewportMetrics(), ...dimensions });
+    const generation = this.generation;
     await InAppBrowserPlugin.updateDimensions({
       ...bounds,
       ratio: window.devicePixelRatio,
     });
+    if (generation !== this.generation)
+      throw failure('CANCELLED', 'The WebView was closed.');
+    this.lastBounds = bounds;
   }
 
   async navigateBack(): Promise<void> {
     this.requireOpen();
+    const resume = this.resumeLiveView();
+    if (resume) await resume;
     await InAppBrowserPlugin.navigateBack();
   }
 
   async navigateForward(): Promise<void> {
     this.requireOpen();
+    const resume = this.resumeLiveView();
+    if (resume) await resume;
     await InAppBrowserPlugin.navigateForward();
   }
 
@@ -253,16 +297,25 @@ export class InAppBrowserClass implements InAppBrowserInterface {
       throw failure('INVALID_ARGUMENT', 'A boolean is required.');
     if (this.capturing)
       throw failure('BUSY', 'A screenshot is already in progress.');
-    this.capturing = true;
     const generation = this.generation;
-    const element = this.element;
-    let blobUrl: string | undefined;
-    try {
-      const result = await InAppBrowserPlugin.captureScreen(
-        this.getDimensions(element),
-      );
+    if (!showScreenCapture) {
+      await InAppBrowserPlugin.setSnapshotMode({ enabled: false });
       if (generation !== this.generation)
         throw failure('CANCELLED', 'The WebView was closed.');
+      this.releaseSnapshot();
+      return;
+    }
+    this.requireCaptureVisible();
+    if (this.snapshotUrl) return;
+    this.capturing = true;
+    const visibilityRevision = this.visibilityRevision;
+    let blobUrl: string | undefined;
+    let switchingSnapshotMode = false;
+    try {
+      const result = await InAppBrowserPlugin.captureScreen();
+      if (generation !== this.generation)
+        throw failure('CANCELLED', 'The WebView was closed.');
+      this.requireCaptureVisible();
       if (!result?.src)
         throw failure(
           'SNAPSHOT_FAILED',
@@ -286,10 +339,7 @@ export class InAppBrowserClass implements InAppBrowserInterface {
         const timer = setTimeout(
           () =>
             finish(
-              failure(
-                'SNAPSHOT_FAILED',
-                'Screenshot image decoding timed out.',
-              ),
+              failure('SNAPSHOT_FAILED', 'Screenshot decoding timed out.'),
             ),
           30000,
         );
@@ -307,26 +357,35 @@ export class InAppBrowserClass implements InAppBrowserInterface {
       });
       if (generation !== this.generation)
         throw failure('CANCELLED', 'The WebView was closed.');
-      await InAppBrowserPlugin[
-        showScreenCapture ? 'hideWebView' : 'showWebView'
-      ]();
+      this.requireCaptureVisible();
+      // Prepare the DOM image underneath the live view before native switches visibility.
+      if (visibilityRevision !== this.visibilityRevision)
+        throw failure('CANCELLED', 'The browser visibility or page changed.');
+      this.applySnapshotStyle(blobUrl);
+      this.snapshotUrl = blobUrl;
+      blobUrl = undefined;
+      switchingSnapshotMode = true;
+      await InAppBrowserPlugin.setSnapshotMode({ enabled: true });
       if (generation !== this.generation)
         throw failure('CANCELLED', 'The WebView was closed.');
-      this.releaseSnapshot();
-      element.style.backgroundSize = showScreenCapture ? 'contain' : 'unset';
-      element.style.backgroundRepeat = showScreenCapture
-        ? 'no-repeat'
-        : 'unset';
-      element.style.backgroundPosition = showScreenCapture
-        ? 'center center'
-        : 'unset';
-      element.style.backgroundImage = showScreenCapture
-        ? `url(${blobUrl})`
-        : 'none';
-      if (showScreenCapture) {
-        this.snapshotUrl = blobUrl;
-        blobUrl = undefined;
+      this.requireCaptureVisible();
+      if (visibilityRevision !== this.visibilityRevision)
+        throw failure('CANCELLED', 'The browser visibility or page changed.');
+    } catch (error) {
+      if (generation === this.generation) {
+        this.releaseSnapshot();
+        if (switchingSnapshotMode) {
+          try {
+            await InAppBrowserPlugin.setSnapshotMode({ enabled: false });
+          } catch (cleanupError) {
+            console.error(
+              'WebView snapshot visibility recovery failed.',
+              cleanupError,
+            );
+          }
+        }
       }
+      throw error;
     } finally {
       if (blobUrl) URL.revokeObjectURL(blobUrl);
       this.capturing = false;
@@ -460,12 +519,21 @@ export class InAppBrowserClass implements InAppBrowserInterface {
         ([key, value]) =>
           !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key) ||
           typeof value !== 'string' ||
-          /[\r\n]/.test(value),
+          Array.from(value).some(character => {
+            const code = character.charCodeAt(0);
+            return (code < 32 && code !== 9) || code === 127;
+          }),
       )
     )
       throw failure(
         'INVALID_ARGUMENT',
         'Headers must be an object of valid header names and string values.',
+      );
+    const names = Object.keys(headers).map(name => name.toLowerCase());
+    if (new Set(names).size !== names.length)
+      throw failure(
+        'INVALID_ARGUMENT',
+        'Header names must be unique ignoring case.',
       );
   }
 
@@ -488,7 +556,265 @@ export class InAppBrowserClass implements InAppBrowserInterface {
       height: bounds.height,
       x: bounds.x,
       y: bounds.y,
+      ...this.validateViewport(bounds),
     };
+  }
+
+  private validateViewport(
+    bounds: Dimensions,
+  ): Pick<
+    Bounds,
+    'viewportWidth' | 'viewportHeight' | 'offsetLeft' | 'offsetTop'
+  > {
+    for (const key of [
+      'viewportWidth',
+      'viewportHeight',
+      'offsetLeft',
+      'offsetTop',
+    ]) {
+      if (
+        bounds[key] !== undefined &&
+        (typeof bounds[key] !== 'number' ||
+          !Number.isFinite(bounds[key]) ||
+          (key.startsWith('viewport') && bounds[key] <= 0))
+      ) {
+        throw failure(
+          'INVALID_ARGUMENT',
+          'Viewport metrics must be finite, with positive width and height.',
+        );
+      }
+    }
+    return {
+      viewportWidth: bounds.viewportWidth,
+      viewportHeight: bounds.viewportHeight,
+      offsetLeft: bounds.offsetLeft ?? 0,
+      offsetTop: bounds.offsetTop ?? 0,
+    };
+  }
+
+  private viewportMetrics(): Pick<
+    Bounds,
+    'viewportWidth' | 'viewportHeight' | 'offsetLeft' | 'offsetTop'
+  > {
+    const viewport = window.visualViewport;
+    const width = viewport?.width ?? window.innerWidth;
+    const height = viewport?.height ?? window.innerHeight;
+    return {
+      viewportWidth: Number.isFinite(width) && width > 0 ? width : undefined,
+      viewportHeight:
+        Number.isFinite(height) && height > 0 ? height : undefined,
+      offsetLeft: viewport?.offsetLeft ?? 0,
+      offsetTop: viewport?.offsetTop ?? 0,
+    };
+  }
+
+  private installLayoutTracking(
+    element: HTMLElement,
+    generation: number,
+  ): void {
+    const schedule = () => this.scheduleLayout(generation);
+    this.resizeObserver = new ResizeObserver(schedule);
+    this.resizeObserver.observe(element);
+    if (typeof document !== 'undefined' && document.documentElement)
+      this.resizeObserver.observe(document.documentElement);
+    const watch = (target: EventTarget, event: string, capture = false) => {
+      if (typeof target?.addEventListener !== 'function') return;
+      target.addEventListener(event, schedule, { capture, passive: true });
+      this.layoutCleanup.push(() =>
+        target.removeEventListener(event, schedule, capture),
+      );
+    };
+    watch(window, 'scroll', true);
+    watch(window, 'resize');
+    watch(window, 'orientationchange');
+    watch(window.visualViewport, 'scroll');
+    watch(window.visualViewport, 'resize');
+    if (
+      typeof MutationObserver !== 'undefined' &&
+      typeof document !== 'undefined' &&
+      document.documentElement
+    ) {
+      this.mutationObserver = new MutationObserver(schedule);
+      this.mutationObserver.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['style', 'class', 'hidden'],
+      });
+    }
+  }
+
+  private scheduleLayout(generation: number): void {
+    if (
+      generation !== this.generation ||
+      this.state !== 'open' ||
+      this.layoutFrame !== undefined
+    )
+      return;
+    const run = () => {
+      if (generation !== this.generation) return;
+      this.layoutFrame = undefined;
+      void this.syncElementLayout(generation).catch(error =>
+        console.error('WebView layout update failed.', error),
+      );
+    };
+    if (typeof window.requestAnimationFrame === 'function')
+      this.layoutFrame = window.requestAnimationFrame(run);
+    else {
+      this.layoutFrame = -1;
+      void Promise.resolve().then(run);
+    }
+  }
+
+  private async syncElementLayout(generation: number): Promise<void> {
+    if (this.layoutActive) {
+      this.layoutPending = true;
+      return;
+    }
+    this.layoutActive = true;
+    try {
+      do {
+        this.layoutPending = false;
+        if (
+          generation !== this.generation ||
+          this.state !== 'open' ||
+          !this.element
+        )
+          return;
+        const rect = this.element.getBoundingClientRect();
+        const metrics = this.viewportMetrics();
+        const visibleHeight =
+          window.visualViewport?.height ?? window.innerHeight;
+        const visible =
+          this.element.isConnected !== false &&
+          [rect.width, rect.height, rect.x, rect.y].every(Number.isFinite) &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          (metrics.viewportWidth === undefined ||
+            (rect.x + rect.width > metrics.offsetLeft &&
+              rect.x < metrics.offsetLeft + metrics.viewportWidth)) &&
+          (visibleHeight === undefined ||
+            (visibleHeight > 0 &&
+              rect.y + rect.height > metrics.offsetTop &&
+              rect.y < metrics.offsetTop + visibleHeight));
+        if (visible) {
+          const bounds = this.validateBounds({
+            width: rect.width,
+            height: rect.height,
+            x: rect.x,
+            y: rect.y,
+            ...metrics,
+          });
+          const keys = [
+            'width',
+            'height',
+            'x',
+            'y',
+            'viewportWidth',
+            'viewportHeight',
+            'offsetLeft',
+            'offsetTop',
+          ];
+          if (
+            !this.lastBounds ||
+            keys.some(key => bounds[key] !== this.lastBounds[key])
+          ) {
+            await InAppBrowserPlugin.updateDimensions(bounds);
+            if (generation !== this.generation) return;
+            this.lastBounds = bounds;
+          }
+        }
+        if (generation !== this.generation) return;
+        if (this.layoutVisible !== visible) {
+          await InAppBrowserPlugin.setLayoutVisibility({ visible });
+          if (generation !== this.generation) return;
+          this.layoutVisible = visible;
+        }
+      } while (this.layoutPending);
+    } finally {
+      if (generation === this.generation) this.layoutActive = false;
+    }
+  }
+
+  private async changeVisibility(hidden: boolean): Promise<void> {
+    this.requireOpen();
+    const generation = this.generation,
+      revision = ++this.visibilityRevision,
+      previous = this.requestedHidden;
+    this.requestedHidden = hidden;
+    try {
+      await InAppBrowserPlugin[hidden ? 'hideWebView' : 'showWebView']();
+      if (generation !== this.generation)
+        throw failure('CANCELLED', 'The WebView was closed.');
+      if (revision === this.visibilityRevision) this.releaseSnapshot();
+    } catch (error) {
+      if (
+        generation === this.generation &&
+        revision === this.visibilityRevision
+      )
+        this.requestedHidden = previous;
+      throw error;
+    }
+  }
+
+  private resumeLiveView(): Promise<void> | undefined {
+    if (this.capturing) throw failure('BUSY', 'A screenshot is in progress.');
+    return this.snapshotUrl ? this.captureScreen(false) : undefined;
+  }
+
+  private requireCaptureVisible(): void {
+    if (
+      this.requestedHidden ||
+      !this.layoutVisible ||
+      !this.element ||
+      this.element.isConnected === false
+    ) {
+      throw failure(
+        'NOT_VISIBLE',
+        'The browser container is hidden or detached.',
+      );
+    }
+  }
+
+  private styleValue(style: CSSStyleDeclaration, key: string): string {
+    return typeof style.getPropertyValue === 'function'
+      ? style.getPropertyValue(key)
+      : style[key.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] ??
+          '';
+  }
+
+  private setStyleValue(
+    style: CSSStyleDeclaration,
+    key: string,
+    value: string,
+    priority = '',
+  ): void {
+    if (typeof style.setProperty === 'function') {
+      if (value) style.setProperty(key, value, priority);
+      else style.removeProperty(key);
+    } else
+      style[key.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] =
+        value;
+  }
+
+  private applySnapshotStyle(url: string): void {
+    const style = this.element.style;
+    this.snapshotStyles = {};
+    for (const [key, value] of Object.entries({
+      'background-image': `url(${url})`,
+      'background-size': 'contain',
+      'background-repeat': 'no-repeat',
+      'background-position': 'center center',
+    })) {
+      const original = this.styleValue(style, key);
+      const priority =
+        typeof style.getPropertyPriority === 'function'
+          ? style.getPropertyPriority(key)
+          : '';
+      this.snapshotStyles[key] = { original, priority, applied: original };
+      this.setStyleValue(style, key, value, priority);
+      this.snapshotStyles[key].applied = this.styleValue(style, key);
+    }
   }
 
   private getDimensions(element: HTMLElement): Bounds {
@@ -496,17 +822,29 @@ export class InAppBrowserClass implements InAppBrowserInterface {
       throw failure('NOT_OPEN', 'The browser container is unavailable.');
     const { width, height, x, y } = element.getBoundingClientRect();
     return this.validateBounds({
-      width: Math.round(width),
-      height: Math.round(height),
-      x: Math.round(x),
-      y: Math.round(y),
+      width,
+      height,
+      x,
+      y,
+      ...this.viewportMetrics(),
     });
   }
 
   private releaseSnapshot(): void {
-    if (!this.snapshotUrl) return;
-    if (this.element) this.element.style.backgroundImage = 'none';
-    URL.revokeObjectURL(this.snapshotUrl);
+    if (this.element && this.snapshotStyles) {
+      for (const [key, saved] of Object.entries(this.snapshotStyles)) {
+        if (this.styleValue(this.element.style, key) === saved.applied) {
+          this.setStyleValue(
+            this.element.style,
+            key,
+            saved.original,
+            saved.priority,
+          );
+        }
+      }
+    }
+    this.snapshotStyles = undefined;
+    if (this.snapshotUrl) URL.revokeObjectURL(this.snapshotUrl);
     this.snapshotUrl = undefined;
   }
 
@@ -514,6 +852,20 @@ export class InAppBrowserClass implements InAppBrowserInterface {
     this.cancelSnapshot?.();
     this.resizeObserver?.disconnect();
     this.resizeObserver = undefined;
+    this.mutationObserver?.disconnect();
+    this.mutationObserver = undefined;
+    for (const cleanup of this.layoutCleanup.splice(0)) cleanup();
+    if (
+      this.layoutFrame !== undefined &&
+      this.layoutFrame >= 0 &&
+      typeof window.cancelAnimationFrame === 'function'
+    ) {
+      window.cancelAnimationFrame(this.layoutFrame);
+    }
+    this.layoutFrame = undefined;
+    this.layoutActive = false;
+    this.layoutPending = false;
+    this.lastBounds = undefined;
     this.releaseSnapshot();
     this.element = undefined;
     this.navigationPolicy = undefined;

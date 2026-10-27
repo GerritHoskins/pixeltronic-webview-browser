@@ -2,6 +2,14 @@ import Foundation
 import UIKit
 import WebKit
 
+// The clipping surface must not consume touches outside the embedded browser.
+private final class BrowserClipView: UIView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hit = super.hitTest(point, with: event)
+        return hit === self ? nil : hit
+    }
+}
+
 @objc public class InAppBrowser: UIViewController, WKUIDelegate, WKNavigationDelegate {
     private(set) var webview: WKWebView?
     weak var plugin: InAppBrowserPlugin?
@@ -9,8 +17,16 @@ import WebKit
     private let headers: [String: String]
     let navigationPolicy: BrowserNavigationPolicy
     private var disposed = false
-    private var loading = false
+    private(set) var loading = false
     var hidden = false
+    var layoutVisible = true
+    var snapshotMode = false
+    var initialURL: URL?
+    var layout: BrowserLayout?
+    private weak var host: WKWebView?
+    private var viewportHeight: NSLayoutConstraint?
+    private var geometryReady = true
+    var captureVisible: Bool { !hidden && layoutVisible && !snapshotMode && geometryReady }
 
     init(_ plugin: InAppBrowserPlugin, configuration: WKWebViewConfiguration,
          headers: [String: String] = [:], policy: BrowserNavigationPolicy) {
@@ -34,13 +50,56 @@ import WebKit
         view.isOpaque = false
         view.customUserAgent = headers.first { $0.key.lowercased() == "user-agent" }?.value
         self.webview = view
-        self.view = view
+        let clip = BrowserClipView(frame: .zero)
+        clip.clipsToBounds = true
+        clip.addSubview(view)
+        self.view = clip
+    }
+
+    func trackHost(_ host: WKWebView) {
+        self.host = host
+        view.translatesAutoresizingMaskIntoConstraints = false
+        let preferredHeight = view.heightAnchor.constraint(equalTo: host.heightAnchor)
+        preferredHeight.priority = .defaultHigh
+        let limit = view.heightAnchor.constraint(lessThanOrEqualToConstant: max(1, host.bounds.height))
+        viewportHeight = limit
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+            view.topAnchor.constraint(equalTo: host.topAnchor),
+            view.widthAnchor.constraint(equalTo: host.widthAnchor),
+            view.heightAnchor.constraint(lessThanOrEqualTo: host.heightAnchor), preferredHeight, limit
+        ])
+        try? applyLayout()
+    }
+
+    override public func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        do { try applyLayout() }
+        catch { geometryReady = false; updateVisibility() }
+    }
+
+    func applyLayout() throws {
+        guard isViewLoaded, let layout = layout else { return }
+        if let host = host, host.bounds.width > 0 {
+            let projected = try layout.project(host: host.bounds.size)
+            if viewportHeight?.constant != projected.clip.height { viewportHeight?.constant = projected.clip.height }
+            webview?.frame = projected.frame
+        } else {
+            _ = try layout.project(host: layout.rect.size)
+            view.frame = layout.rect
+            webview?.frame = view.bounds
+        }
+        geometryReady = true
+        updateVisibility()
     }
 
     @discardableResult func loadUrl(_ url: URL) -> WKNavigation? {
         guard !disposed, navigationPolicy.evaluate(url).allowed else { return nil }
         loadViewIfNeeded()
-        return webview?.load(URLRequest(url: url))
+        loading = true
+        snapshotMode = false
+        updateVisibility()
+        return webview?.load(BrowserRequest.make(url, initialURL: initialURL ?? url, headers: headers))
     }
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -117,17 +176,24 @@ import WebKit
         guard !disposed, let webview = webview else {
             completion(nil, BrowserInputError(message: "No WebView is open.")); return
         }
-        webview.takeSnapshot(with: nil, completionHandler: completion)
+        let config = WKSnapshotConfiguration()
+        let size = webview.bounds.size
+        let screenScale = webview.window?.screen.scale ?? UIScreen.main.scale
+        let scale = min(screenScale, 2048 / max(size.width, size.height))
+        // WebKit accepts points and emits pixels at the screen scale.
+        config.snapshotWidth = NSNumber(value: Double(size.width * scale / screenScale))
+        webview.takeSnapshot(with: config, completionHandler: completion)
     }
 
     func sendLoadingEvent(_ isLoading: Bool) {
         guard !disposed else { return }
         loading = isLoading
+        if isLoading { snapshotMode = false }
         updateVisibility()
         plugin?.notifyEventListeners(eventName: "pageLoaded", eventValue: ["isLoading": isLoading])
     }
 
-    func updateVisibility() { if isViewLoaded { view.isHidden = hidden || loading } }
+    func updateVisibility() { if isViewLoaded { view.isHidden = hidden || loading || !layoutVisible || snapshotMode || !geometryReady } }
 
     func dispose() {
         guard !disposed else { return }
