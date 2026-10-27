@@ -1,124 +1,69 @@
 package dev.pixeltronic.plugins.pixeltronicwebviewbrowser;
 
-import android.content.Context;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.PluginCall;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
 
-public class InAppBrowserOptions {
+/** Validation produces complete values before any native state is mutated. */
+final class InAppBrowserOptions {
+    static final class Bounds {
+        final double width, height, x, y;
 
-    private JSObject headers = null;
-    private Context context;
-    private JSObject colorScheme = null;
-    private PluginCall savedCall = null;
-    private String targetUrl = null;
-    private boolean hidden = false;
-    private int width = 1;
-    private int height = 1;
-    private int x = 0;
-    private int y = 0;
-    private float ratio = 0.5f;
+        Bounds(Double width, Double height, Double x, Double y) {
+            if (!finite(width) || !finite(height) || !finite(x) || !finite(y) || width <= 0 || height <= 0) {
+                throw new IllegalArgumentException("Finite x/y and positive width/height are required.");
+            }
+            this.width = width;
+            this.height = height;
+            this.x = x;
+            this.y = y;
+        }
 
-    public InAppBrowserOptions(Context context) {
-        this.context = context;
+        private static boolean finite(Double value) { return value != null && Double.isFinite(value); }
+
+        static Bounds from(PluginCall call) {
+            return new Bounds(call.getDouble("width"), call.getDouble("height"), call.getDouble("x"), call.getDouble("y"));
+        }
     }
 
-    public JSObject getHeaders() {
-        return headers;
+    static String url(String value) {
+        try {
+            if (value == null || value.isEmpty() || value.chars().anyMatch(Character::isWhitespace)) {
+                throw new URISyntaxException("", "Missing or invalid URL");
+            }
+            URI uri = new URI(value);
+            if (!uri.isAbsolute() || (("http".equalsIgnoreCase(uri.getScheme()) || "https".equalsIgnoreCase(uri.getScheme())) &&
+                (uri.getHost() == null || uri.getHost().isEmpty()))) {
+                throw new URISyntaxException(value, "An absolute URL is required");
+            }
+            return value;
+        } catch (URISyntaxException ex) {
+            throw new IllegalArgumentException("An absolute URL without whitespace is required.");
+        }
     }
 
-    public void setHeaders(JSObject headers) {
-        this.headers = headers;
-    }
-
-    public JSObject getColorScheme() {
-        return colorScheme;
-    }
-
-    public void setColorScheme(JSObject colorScheme) {
-        this.colorScheme = colorScheme;
-    }
-
-    public PluginCall getSavedCall() {
-        return savedCall;
-    }
-
-    public void setSavedCall(PluginCall savedCall) {
-        this.savedCall = savedCall;
-    }
-
-    public String getTargetUrl() {
-        return targetUrl;
-    }
-
-    public void setTargetUrl(String targetUrl) {
-        this.targetUrl = targetUrl;
-    }
-
-    public boolean isHidden() {
-        return hidden;
-    }
-
-    public void setHidden(boolean hidden) {
-        this.hidden = hidden;
-    }
-
-    public int getWidth() {
-        return width;
-    }
-
-    public int getWidthInPixels() {
-        return (int) getPixels(width);
-    }
-
-    public void setWidth(int width) {
-        this.width = width;
-    }
-
-    public int getHeight() {
-        return height;
-    }
-
-    public int getHeightInPixels() {
-        return (int) getPixels(height);
-    }
-
-    public void setHeight(int height) {
-        this.height = height;
-    }
-
-    public int getX() {
-        return x;
-    }
-
-    public int getXInPixels() {
-        return (int) getPixels(x);
-    }
-
-    public void setX(int x) {
-        this.x = x;
-    }
-
-    public int getY() {
-        return y;
-    }
-
-    public int getYInPixels() {
-        return (int) getPixels(y);
-    }
-
-    public void setY(int y) {
-        this.y = y;
-    }
-
-    public float getRatio() {
-        return ratio;
-    }
-
-    public void setRatio(float ratio) {
-        this.ratio = ratio;
-    }
-
-    private float getPixels(int value) {
-        return value * context.getResources().getDisplayMetrics().density + 0.5f;
+    static Map<String, String> headers(PluginCall call) {
+        JSObject data = call.getData();
+        JSObject headers = call.getObject("headers");
+        if (data != null && data.has("headers") && headers == null) {
+            throw new IllegalArgumentException("Headers must be an object.");
+        }
+        Map<String, String> result = new HashMap<>();
+        if (headers == null) return result;
+        Iterator<String> keys = headers.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            Object value = headers.opt(key);
+            if (!key.matches("[!#$%&'*+.^_`|~0-9A-Za-z-]+") || !(value instanceof String) ||
+                ((String) value).contains("\r") || ((String) value).contains("\n")) {
+                throw new IllegalArgumentException("Invalid header name or value.");
+            }
+            result.put(key, (String) value);
+        }
+        return result;
     }
 }

@@ -1,144 +1,145 @@
 import Foundation
-import Capacitor
 import UIKit
 import WebKit
 
 @objc public class InAppBrowser: UIViewController, WKUIDelegate, WKNavigationDelegate {
-    var webview: WKWebView?
-    var plugin: InAppBrowserPlugin!
-    var configuration: WKWebViewConfiguration!
-    var currentDecisionHandler: ((WKNavigationResponsePolicy) -> Void)?
-    var openNewWindow: Bool = false
-    var currentUrl: URL?
-    var originalUserAgent: String?
+    private(set) var webview: WKWebView?
+    weak var plugin: InAppBrowserPlugin?
+    private let configuration: WKWebViewConfiguration
+    private let headers: [String: String]
+    private(set) var currentDecisionHandler: ((WKNavigationResponsePolicy) -> Void)?
+    private var decisionTimeout: DispatchWorkItem?
+    private var decisionGeneration = 0
+    private var openNewWindow = false
+    private var currentUrl: URL?
+    private var disposed = false
+    private var loading = false
+    var hidden = false
 
-    init(_ plugin: InAppBrowserPlugin, configuration: WKWebViewConfiguration) {
-        super.init(nibName: "InAppBrowser", bundle: nil)
+    init(_ plugin: InAppBrowserPlugin, configuration: WKWebViewConfiguration, headers: [String: String] = [:]) {
         self.plugin = plugin
         self.configuration = configuration
+        self.headers = headers
+        super.init(nibName: nil, bundle: nil)
     }
 
-    required init?(coder aDecoder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
+    required init?(coder: NSCoder) { return nil }
 
     override public func loadView() {
-        let webview = WKWebView(frame: .zero, configuration: self.configuration)
-        webview.uiDelegate = self
-        webview.navigationDelegate = self
-        webview.backgroundColor = .white
-        webview.scrollView.bounces = false
-        webview.allowsBackForwardNavigationGestures = true
-        webview.isOpaque = false
-        webview.customUserAgent = userAgentToUse()
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.uiDelegate = self
+        view.navigationDelegate = self
+        view.backgroundColor = .white
+        view.scrollView.bounces = false
+        view.allowsBackForwardNavigationGestures = true
+        view.isOpaque = false
+        view.customUserAgent = headers.first { $0.key.lowercased() == "user-agent" }?.value
+        self.webview = view
+        self.view = view
+    }
 
-        self.webview = webview
-        view = webview
+    @discardableResult func loadUrl(_ url: URL) -> WKNavigation? {
+        guard !disposed else { return nil }
+        loadViewIfNeeded()
+        return webview?.load(URLRequest(url: url))
     }
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard !disposed else { return }
         currentUrl = webView.url
-        plugin?.savedCall?.resolve()
-        plugin?.savedCall = nil
+        plugin?.navigationFinished(self, navigation: navigation)
         sendLoadingEvent(false)
     }
 
     public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        self.handleError(errorCode: error._code as NSNumber)
-    }
-
-    public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        self.handleError(errorCode: error._code as NSNumber)
-    }
-
-    public func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
-            if plugin.hasEventListeners(eventName: "navigationHandler") {
-                self.openNewWindow = true
-            }
-            self.loadUrl(url)
-        }
-        return nil
-    }
-
-    public func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        self.sendLoadingEvent(true)
-        self.clearDecisionHandler()
-    }
-
-    public func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        if self.currentDecisionHandler != nil {
-            self.clearDecisionHandler()
-        }
-        let hasHandler = self.plugin.hasEventListeners(eventName: "navigationHandler")
-        if hasHandler {
-            self.currentDecisionHandler = decisionHandler
-            self.plugin.notifyEventListeners(eventName: "navigationHandler", eventValue: [
-                "url": navigationResponse.response.url?.absoluteString ?? "",
-                "newWindowRequest": self.openNewWindow,
-                "isSameHost": currentUrl?.host == navigationResponse.response.url?.host
-            ])
-            self.openNewWindow = false
-        } else {
-            decisionHandler(.allow)
-            return
-        }
-    }
-
-    func clearDecisionHandler() {
-        if self.currentDecisionHandler != nil {
-            self.currentDecisionHandler!(.allow)
-            self.currentDecisionHandler = nil
-        }
-    }
-
-    public func loadUrl(_ url: URL) {
-        self.setHeaders()
-        self.webview?.customUserAgent = self.customUserAgent ?? self.userAgent ?? self.originalUserAgent
-        self.webview?.load(URLRequest(url: url))
-    }
-
-    override public func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
-        super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
-    }
-
-    func setHeaders() {
-        if let userAgent = plugin.headers?["User-Agent"] {
-            customUserAgent = userAgent
-            plugin.headers?.removeValue(forKey: "User-Agent")
-        }
-    }
-
-    func handleError(errorCode: NSNumber) {
-        if plugin.hasEventListeners(eventName: "pageLoadError") {
-            plugin.notifyEventListeners(eventName: "pageLoadError", eventValue: ["errorCode": errorCode])
-        }
+        guard !disposed else { return }
+        plugin?.navigationFailed(self, navigation: navigation, error: error)
         sendLoadingEvent(false)
     }
 
-    func sendLoadingEvent(_ isLoading: Bool) {
-        view.isHidden = isLoading
-        plugin.notifyEventListeners(eventName: "pageLoaded", eventValue: ["isLoading": isLoading])
+    public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        self.webView(webView, didFail: navigation, withError: error)
     }
 
-    var customUserAgent: String? {
-        didSet {
-            webview?.customUserAgent = userAgentToUse()
-        }
+    public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard !disposed else { return }
+        plugin?.contentProcessTerminated(self)
     }
 
-    var userAgent: String? {
-        didSet {
-            webview?.customUserAgent = userAgentToUse()
-        }
+    public func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard !disposed else { return }
+        sendLoadingEvent(true)
     }
 
-    private func userAgentToUse() -> String? {
-        if let customAgent = customUserAgent {
-            return customAgent
-        } else if let originalAgent = originalUserAgent, let userAgent = userAgent {
-            return "\(originalAgent) \(userAgent)"
+    public func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                        for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        guard !disposed else { return nil }
+        if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
+            openNewWindow = true
+            loadUrl(url)
         }
         return nil
+    }
+
+    public func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        guard !disposed else { decisionHandler(.cancel); return }
+        completeDecision(.cancel)
+        guard plugin?.hasEventListeners(eventName: "navigationHandler") == true else { decisionHandler(.allow); return }
+        currentDecisionHandler = decisionHandler
+        let generation = decisionGeneration
+        let timeout = DispatchWorkItem { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self, self.decisionGeneration == generation else { return }
+                self.completeDecision(.cancel)
+            }
+        }
+        decisionTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
+        plugin?.notifyEventListeners(eventName: "navigationHandler", eventValue: [
+            "url": navigationResponse.response.url?.absoluteString ?? "",
+            "newWindowRequest": openNewWindow,
+            "isSameHost": currentUrl?.host != nil && currentUrl?.host == navigationResponse.response.url?.host
+        ])
+        openNewWindow = false
+    }
+
+    func completeDecision(_ policy: WKNavigationResponsePolicy) {
+        decisionGeneration += 1
+        decisionTimeout?.cancel()
+        decisionTimeout = nil
+        let handler = currentDecisionHandler
+        currentDecisionHandler = nil
+        handler?(policy)
+        if handler != nil && policy == .cancel { sendLoadingEvent(false) }
+    }
+
+    func snapshot(_ completion: @escaping (UIImage?, Error?) -> Void) {
+        guard !disposed, let webview = webview else {
+            completion(nil, BrowserInputError(message: "No WebView is open.")); return
+        }
+        webview.takeSnapshot(with: nil, completionHandler: completion)
+    }
+
+    func sendLoadingEvent(_ isLoading: Bool) {
+        guard !disposed else { return }
+        loading = isLoading
+        updateVisibility()
+        plugin?.notifyEventListeners(eventName: "pageLoaded", eventValue: ["isLoading": isLoading])
+    }
+
+    func updateVisibility() { if isViewLoaded { view.isHidden = hidden || loading } }
+
+    func dispose() {
+        guard !disposed else { return }
+        disposed = true
+        completeDecision(.cancel)
+        webview?.stopLoading()
+        webview?.navigationDelegate = nil
+        webview?.uiDelegate = nil
+        willMove(toParent: nil)
+        if isViewLoaded { view.removeFromSuperview() }
+        removeFromParent()
+        plugin = nil
     }
 }

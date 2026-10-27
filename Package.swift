@@ -16,6 +16,15 @@ let package = Package(
             dependencies: [.product(name: "Capacitor", package: "capacitor-swift-pm")],
             path: "ios/Plugin",
             exclude: ["InAppBrowserPlugin.h", "InAppBrowserPlugin.m", "Info.plist"]
+        ),
+        .testTarget(
+            name: "PixeltronicWebviewBrowserTests",
+            dependencies: [
+                "PixeltronicWebviewBrowser",
+                .product(name: "Capacitor", package: "capacitor-swift-pm")
+            ],
+            path: "ios/PluginTests",
+            exclude: ["Info.plist"]
         )
     ]
 )

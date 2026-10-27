@@ -3,10 +3,11 @@ package dev.pixeltronic.plugins.pixeltronicwebviewbrowser;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.graphics.Bitmap;
-import android.os.Build;
+import android.graphics.Canvas;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Message;
-import android.text.TextUtils;
-import android.util.Log;
+import android.util.Base64;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.WebChromeClient;
@@ -16,275 +17,253 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
-
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
-
-import java.net.MalformedURLException;
-import java.net.URL;
+import java.net.URI;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.Map;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 @CapacitorPlugin(name = "InAppBrowserPlugin", permissions = { @Permission(strings = { Manifest.permission.INTERNET }, alias = "internet") })
 public class InAppBrowserPlugin extends Plugin {
-
-    private static final String LOG_TAG = "pixeltronic";
-    private static final String NO_WEBVIEW_ERROR = "No valid InAppBrowser instance found";
-    private static final String MISSING_DIMENSIONS_ERROR = "Height or width is missing";
-    private static final String INVALID_MISSING_URL_ERROR = "must provide a valid URL to open";
-
+    private static final long TIMEOUT_MS = 30000;
     private WebView webView;
-    private InAppBrowserOptions options;
-    private boolean isLoading = false;
+    private boolean destroyed;
+    private boolean hidden;
+    private boolean loading;
+    private boolean opening;
+    private CallResult openingOwner;
+    private CallResult pendingLoad;
+    private Runnable loadTimeout;
+    private Map<String, String> headers = new HashMap<>();
+    private final Map<CallResult, Runnable> captures = new HashMap<>();
+    private ExecutorService encoder;
+    private Handler handler;
+
+    @PluginMethod
+    public void openWebView(PluginCall call) {
+        execute(call, result -> {
+            String url = InAppBrowserOptions.url(call.getString("url"));
+            InAppBrowserOptions.Bounds bounds = InAppBrowserOptions.Bounds.from(call);
+            Map<String, String> requestHeaders = InAppBrowserOptions.headers(call);
+            if (webView != null) { result.reject("BUSY", "Close the existing WebView before opening another."); return; }
+            WebView view = createWebView();
+            webView = view;
+            headers = requestHeaders;
+            hidden = false;
+            opening = true;
+            openingOwner = result;
+            configureWebSettings(view);
+            view.setWebViewClient(createWebViewClient());
+            view.setWebChromeClient(createWebChromeClient());
+            attachWebView(view, bounds);
+            beginLoad(result);
+            // Header behavior is unchanged in Stage 1; policy/parity is handled separately.
+            view.loadUrl(url);
+        });
+    }
+
+    @PluginMethod
+    public void closeWebView(PluginCall call) {
+        // Close remains safe after native teardown as well as after a previous close.
+        runOnUI(() -> {
+            CallResult result = new CallResult(call);
+            try {
+                closeInternal("CANCELLED", "The WebView was closed.");
+                result.resolve();
+            } catch (RuntimeException ex) {
+                result.reject("NATIVE_ERROR", "The WebView could not be disposed.");
+            }
+        });
+    }
+
+    @PluginMethod public void showWebView(PluginCall call) { withView(call, false, (view, result) -> { hidden = false; updateVisibility(); result.resolve(); }); }
+    @PluginMethod public void hideWebView(PluginCall call) { withView(call, false, (view, result) -> { hidden = true; updateVisibility(); result.resolve(); }); }
+    @PluginMethod public void navigateBack(PluginCall call) { withView(call, true, (view, result) -> { if (view.canGoBack()) view.goBack(); result.resolve(); }); }
+    @PluginMethod public void navigateForward(PluginCall call) { withView(call, true, (view, result) -> { if (view.canGoForward()) view.goForward(); result.resolve(); }); }
+    @PluginMethod public void refresh(PluginCall call) { withView(call, true, (view, result) -> { view.reload(); result.resolve(); }); }
+
+    @PluginMethod
+    public void loadUrl(PluginCall call) {
+        withView(call, true, (view, result) -> {
+            String url = InAppBrowserOptions.url(call.getString("url"));
+            beginLoad(result);
+            loadUrlWithHeaders(view, url);
+        });
+    }
+
+    @PluginMethod
+    public void updateDimensions(PluginCall call) {
+        withView(call, false, (view, result) -> {
+            InAppBrowserOptions.Bounds bounds = InAppBrowserOptions.Bounds.from(call);
+            applyBounds(view, bounds);
+            result.resolve();
+        });
+    }
+
+    @PluginMethod
+    public void onNavigation(PluginCall call) {
+        withView(call, false, (view, result) -> {
+            if (call.getBoolean("allow") == null) throw new IllegalArgumentException("A boolean allow value is required.");
+            result.reject("UNIMPLEMENTED", "Android navigation decisions are not implemented.");
+        });
+    }
+
+    @PluginMethod
+    public void captureScreen(PluginCall call) {
+        withView(call, true, (view, result) -> {
+            if (!captures.isEmpty()) { result.reject("BUSY", "A screenshot is already in progress."); return; }
+            if (view.getWidth() <= 0 || view.getHeight() <= 0) throw new IllegalArgumentException("The WebView has no drawable bounds.");
+            Bitmap bitmap = Bitmap.createBitmap(view.getWidth(), view.getHeight(), Bitmap.Config.ARGB_8888);
+            try {
+                view.draw(new Canvas(bitmap));
+            } catch (RuntimeException ex) {
+                bitmap.recycle();
+                throw ex;
+            }
+            Runnable timeout = () -> finishCapture(result, null, "Screenshot encoding timed out.");
+            captures.put(result, timeout);
+            postTimeout(timeout);
+            if (encoder == null) encoder = Executors.newSingleThreadExecutor();
+            try {
+                encoder.execute(new InAppBrowserScreenTask(bitmap,
+                    bytes -> runOnUI(() -> finishCapture(result, bytes, null)),
+                    error -> runOnUI(() -> finishCapture(result, null, "Screenshot encoding failed."))));
+            } catch (RuntimeException ex) {
+                bitmap.recycle();
+                finishCapture(result, null, "Screenshot encoding could not start.");
+            }
+        });
+    }
+
+    private void finishCapture(CallResult result, byte[] bytes, String error) {
+        Runnable timeout = captures.remove(result);
+        if (timeout == null) return; // Close, teardown, or timeout already settled it.
+        cancelTimeout(timeout);
+        if (error != null) result.reject("SNAPSHOT_FAILED", error);
+        else result.resolve(new JSObject().put("src", Base64.encodeToString(bytes, Base64.NO_WRAP)));
+    }
+
+    private interface ViewAction { void run(WebView view, CallResult result); }
+
+    private void withView(PluginCall call, boolean requireIdle, ViewAction action) {
+        execute(call, result -> {
+            if (webView == null) { result.reject("NOT_OPEN", "No WebView is open."); return; }
+            if (requireIdle && (pendingLoad != null || opening || !captures.isEmpty())) { result.reject("BUSY", "A load or screenshot is already in progress."); return; }
+            action.run(webView, result);
+        });
+    }
+
+    private void execute(PluginCall call, Consumer<CallResult> action) {
+        CallResult result = new CallResult(call);
+        runOnUI(() -> {
+            if (destroyed) { result.reject("DESTROYED", "The plugin has been destroyed."); return; }
+            try {
+                action.accept(result);
+            } catch (IllegalArgumentException ex) {
+                result.reject("INVALID_ARGUMENT", ex.getMessage());
+                if (openingOwner == result || pendingLoad == result) closeInternal("INVALID_ARGUMENT", ex.getMessage());
+            } catch (RuntimeException ex) {
+                result.reject("NATIVE_ERROR", "The native operation failed.");
+                if (openingOwner == result || pendingLoad == result) closeInternal("NATIVE_ERROR", "The native operation failed.");
+            }
+        });
+    }
+
+    protected void runOnUI(Runnable runnable) { getBridge().executeOnMainThread(runnable); }
+    protected void postTimeout(Runnable runnable) { if (handler == null) handler = new Handler(Looper.getMainLooper()); handler.postDelayed(runnable, TIMEOUT_MS); }
+    protected void cancelTimeout(Runnable runnable) { if (handler != null && runnable != null) handler.removeCallbacks(runnable); }
+    protected WebView createWebView() { return new WebView(getContext()); }
+
+    protected void attachWebView(WebView view, InAppBrowserOptions.Bounds bounds) {
+        ViewGroup parent = (ViewGroup) getBridge().getWebView().getParent();
+        parent.addView(view, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        applyBounds(view, bounds);
+    }
+
+    private void applyBounds(WebView view, InAppBrowserOptions.Bounds bounds) {
+        float density = view.getResources().getDisplayMetrics().density;
+        double scaledWidth = bounds.width * density, scaledHeight = bounds.height * density;
+        if (!Double.isFinite(scaledWidth) || !Double.isFinite(scaledHeight) || scaledWidth > Integer.MAX_VALUE || scaledHeight > Integer.MAX_VALUE ||
+            Math.abs(bounds.x * density) > Integer.MAX_VALUE || Math.abs(bounds.y * density) > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Bounds exceed the native coordinate range.");
+        }
+        ViewGroup.LayoutParams params = view.getLayoutParams();
+        params.width = Math.max(1, (int) Math.round(scaledWidth));
+        params.height = Math.max(1, (int) Math.round(scaledHeight));
+        view.setLayoutParams(params);
+        view.setX((float) (bounds.x * density));
+        view.setY((float) (bounds.y * density));
+    }
+
+    private void beginLoad(CallResult result) {
+        pendingLoad = result;
+        loadTimeout = () -> {
+            if (pendingLoad != result) return;
+            closeInternal("LOAD_TIMEOUT", "Page loading timed out.");
+        };
+        postTimeout(loadTimeout);
+    }
+
+    private void finishLoad(String code, String message) {
+        CallResult result = pendingLoad;
+        pendingLoad = null;
+        cancelTimeout(loadTimeout);
+        loadTimeout = null;
+        opening = false;
+        openingOwner = null;
+        if (result != null) { if (code == null) result.resolve(); else result.reject(code, message); }
+    }
+
+    private void closeInternal(String code, String message) {
+        WebView view = webView;
+        webView = null; // Invalidate callbacks before stopping/destroying the view.
+        finishLoad(code, message);
+        for (Map.Entry<CallResult, Runnable> entry : captures.entrySet()) {
+            cancelTimeout(entry.getValue());
+            entry.getKey().reject(code, message);
+        }
+        captures.clear();
+        headers = new HashMap<>();
+        hidden = false;
+        loading = false;
+        if (view != null) {
+            view.stopLoading();
+            view.setWebViewClient(null);
+            view.setWebChromeClient(null);
+            if (view.getParent() instanceof ViewGroup) ((ViewGroup) view.getParent()).removeView(view);
+            view.destroy();
+        }
+    }
 
     @Override
-    public void load() {
-        super.load();
-        options = new InAppBrowserOptions(this.getContext());
+    protected void handleOnDestroy() {
+        runOnUI(() -> {
+            destroyed = true;
+            closeInternal("CANCELLED", "The plugin was destroyed.");
+            // Queued bitmap encodes still recycle their bitmaps; their callbacks are ignored.
+            if (encoder != null) { encoder.shutdown(); encoder = null; }
+        });
     }
 
-    @PluginMethod
-    public void openWebView(final PluginCall call) {
-        /*if (!InAppBrowserHelper.isPackageInstalled(this.getContext(), "com.google.android.webview")) {
-            call.reject(LOG_TAG, "Android web view is not installed");
-            return;
-        }*/
-        options.setSavedCall(call);
-        getActivity().runOnUiThread(this::configureWebView);
-    }
-
-    @PluginMethod
-    public void closeWebView(final PluginCall call) {
-        runOnUI(
-            () -> {
-                if (webViewExists()) {
-                    removeAndDestroyWebView();
-                    options.setHidden(false);
-                    call.resolve();
-                }
-            }
-        );
-    }
-
-    @PluginMethod
-    public void showWebView(final PluginCall call) {
-        toggleWebViewVisibility(call, View.VISIBLE);
-    }
-
-    @PluginMethod
-    public void hideWebView(final PluginCall call) {
-        toggleWebViewVisibility(call, View.INVISIBLE);
-    }
-
-    @PluginMethod
-    public void navigateBack(final PluginCall call) {
-        performWebViewAction(call, webView::goBack);
-    }
-
-    @PluginMethod
-    public void navigateForward(final PluginCall call) {
-        performWebViewAction(call, webView::goForward);
-    }
-
-    @PluginMethod
-    public void refresh(final PluginCall call) {
-        performWebViewAction(call, webView::reload);
-    }
-
-    @PluginMethod
-    public void loadUrl(final PluginCall call) {
-        String urlString = call.getString("url");
-        if (TextUtils.isEmpty(urlString)) {
-            call.reject(LOG_TAG, INVALID_MISSING_URL_ERROR);
-            return;
-        }
-
-        if (!webViewExists()) {
-            call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-            return;
-        }
-
-        options.setSavedCall(call);
-        runOnUI(() -> loadUrlWithHeaders(urlString));
-    }
-
-    @PluginMethod
-    public void onNavigation(final PluginCall call) {
-        if (!webViewExists()) {
-            call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-        }
-    }
-
-    @PluginMethod
-    public void updateDimensions(final PluginCall call) {
-        if (webView != null) {
-            getActivity()
-                .runOnUiThread(
-                    () -> {
-                        setWebViewOptions(call);
-
-                        ViewGroup.LayoutParams params = webView.getLayoutParams();
-
-                        params.width = options.getWidthInPixels();
-                        params.height = options.getHeightInPixels();
-                        webView.setX(options.getXInPixels());
-                        webView.setY(options.getYInPixels());
-                        webView.requestLayout();
-
-                        if (options.isHidden()) {
-                            // notifyListeners("captureScreen", new JSObject());
-                        }
-
-                        call.resolve();
-                    }
-                );
-        }
-    }
-
-    @PluginMethod
-    public void captureScreen(final PluginCall call) {
-        if (webView == null) {
-            call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-            return;
-        }
-        if (webView.getWidth() > 0 && webView.getHeight() > 0) {
-            Executor executor = Executors.newSingleThreadExecutor();
-            executor.execute(new InAppBrowserScreenTask(call, webView));
-        } else {
-            call.reject(LOG_TAG, MISSING_DIMENSIONS_ERROR);
-        }
-    }
-
-    private void performWebViewAction(final PluginCall call, Runnable action) {
-        runOnUI(
-            () -> {
-                if (webViewExists()) {
-                    action.run();
-                    call.resolve();
-                }
-            }
-        );
-    }
-
-    private void toggleWebViewVisibility(final PluginCall call, int visibility) {
-        runOnUI(
-            () -> {
-                if (webViewExists()) {
-                    webView.setVisibility(visibility);
-                    call.resolve();
-                }
-            }
-        );
-    }
-
-    private void runOnUI(Runnable action) {
-        getActivity().runOnUiThread(action);
-    }
-
-    private boolean webViewExists() {
-        if (webView == null) {
-            notifyError(NO_WEBVIEW_ERROR);
-            return false;
-        }
-        return true;
-    }
-
-    private void notifyError(String errorMessage) {
-        notifyListeners("error", new JSObject().put("message", errorMessage));
-    }
-
-    private void removeAndDestroyWebView() {
-        ViewGroup rootGroup = ((ViewGroup) getBridge().getWebView().getParent());
-        rootGroup.removeView(webView);
-        webView.destroy();
-        webView = null;
-    }
-
-    private void loadUrlWithHeaders(String urlString) {
-        if (webView == null) {
-            return;
-        }
-        JSObject headers = options.getHeaders();
-        if (headers == null) {
-            webView.loadUrl(urlString);
-            return;
-        }
-
+    private void loadUrlWithHeaders(WebView view, String url) {
         Map<String, String> requestHeaders = new HashMap<>();
-        Iterator<String> keys = headers.keys();
-        while (keys.hasNext()) {
-            String key = keys.next();
-            String value = headers.getString(key);
-            if (value == null) {
-                continue;
-            }
-
-            if (TextUtils.equals(key, "User-Agent")) {
-                webView.getSettings().setUserAgentString(value);
-            } else {
-                requestHeaders.put(key, value);
-            }
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            if (entry.getKey().equalsIgnoreCase("User-Agent")) view.getSettings().setUserAgentString(entry.getValue());
+            else requestHeaders.put(entry.getKey(), entry.getValue());
         }
-        webView.loadUrl(urlString, requestHeaders);
-    }
-
-    private void configureWebView() {
-        PluginCall call = options.getSavedCall();
-        try {
-            options.setHidden(false);
-
-            webView = new WebView(this.getContext());
-            webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-            webView.setDrawingCacheEnabled(true);
-
-            configureWebSettings(call);
-
-            bridge.getWebView().getSettings().setJavaScriptCanOpenWindowsAutomatically(true);
-
-            webView.setWebChromeClient(createWebChromeClient());
-            webView.setWebViewClient(createWebViewClient());
-            webView.setVisibility(View.INVISIBLE);
-
-            String urlString = call.getString("url");
-            if (urlString == null || urlString.isEmpty()) {
-                call.reject(LOG_TAG, INVALID_MISSING_URL_ERROR);
-            }
-
-            setWebViewOptions(call);
-
-            ViewGroup.LayoutParams params = new ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            );
-
-            params.width = options.getWidthInPixels();
-            params.height = options.getHeightInPixels();
-            webView.setX(options.getXInPixels());
-            webView.setY(options.getYInPixels());
-            webView.requestLayout();
-
-            ((ViewGroup) getBridge().getWebView().getParent()).addView(webView);
-
-            if (urlString != null) {
-                webView.loadUrl(urlString);
-            }
-        } catch (Exception e) {
-            isLoading = false;
-            sendLoadingEvent();
-            call.reject(LOG_TAG, NO_WEBVIEW_ERROR);
-        }
+        view.loadUrl(url, requestHeaders);
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private void configureWebSettings(final PluginCall call) {
-        WebSettings settings = webView.getSettings();
+    private void configureWebSettings(WebView view) {
+        WebSettings settings = view.getSettings();
         settings.setJavaScriptCanOpenWindowsAutomatically(true);
         settings.setJavaScriptEnabled(true);
         settings.setDatabaseEnabled(true);
@@ -297,161 +276,82 @@ public class InAppBrowserPlugin extends Plugin {
         settings.setUseWideViewPort(true);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         settings.setSupportMultipleWindows(true);
-
-        JSObject headers = call.getObject("headers", null);
-        if (headers != null) {
-            options.setHeaders(headers);
-        }
     }
 
     private WebChromeClient createWebChromeClient() {
         return new WebChromeClient() {
-            @Override
-            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
-                WebView createdWebView = new WebView(getActivity());
-                createdWebView.setWebViewClient(createNewWebViewClient());
-                WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
-                transport.setWebView(createdWebView);
-                resultMsg.sendToTarget();
+            @Override public boolean onCreateWindow(WebView view, boolean dialog, boolean userGesture, Message message) {
+                if (view != webView) return false;
+                WebView popup = createWebView();
+                popup.setWebViewClient(new WebViewClient() {
+                    @Override public void onLoadResource(WebView child, String url) {
+                        if (webView == view) {
+                            if (hasListeners("navigationHandler")) navigationEvent(url, true);
+                            else view.loadUrl(url);
+                        }
+                        child.stopLoading();
+                        child.destroy();
+                    }
+                });
+                ((WebView.WebViewTransport) message.obj).setWebView(popup);
+                message.sendToTarget();
                 return true;
-            }
-        };
-    }
-
-    private WebViewClient createNewWebViewClient() {
-        return new WebViewClient() {
-            @Override
-            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    handlePageLoadError(error.getErrorCode());
-                }
-            }
-
-            @Override
-            public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
-                handlePageLoadError(errorResponse.getStatusCode());
-            }
-
-            @Override
-            public void onLoadResource(WebView view, String url) {
-                if (hasListeners("navigationHandler")) {
-                    handleNavigationEvent(url, true);
-                } else {
-                    webView.loadUrl(url);
-                }
-                view.removeAllViews();
-                view.destroy();
             }
         };
     }
 
     private WebViewClient createWebViewClient() {
         return new WebViewClient() {
-            @Override
-            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                super.onReceivedError(view, request, error);
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    handlePageLoadError(error.getErrorCode());
-                }
+            @Override public void onPageStarted(WebView view, String url, Bitmap icon) {
+                if (view != webView) return;
+                loading = true;
+                loadingEvent();
             }
-
-            @Override
-            public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
-                super.onReceivedHttpError(view, request, errorResponse);
-                handlePageLoadError(errorResponse.getStatusCode());
+            @Override public void onPageFinished(WebView view, String url) {
+                if (view != webView || (view.getUrl() != null && !url.equals(view.getUrl()))) return;
+                loading = false;
+                finishLoad(null, null);
+                loadingEvent();
             }
-
-            @Override
-            public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                super.onPageStarted(view, url, favicon);
-                isLoading = true;
-                sendLoadingEvent();
+            @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                if (view == webView && request.isForMainFrame()) pageFailed(error.getErrorCode());
             }
-
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                super.onPageFinished(view, url);
-                isLoading = false;
-                sendLoadingEvent();
-                if (options.getSavedCall() != null) {
-                    options.getSavedCall().resolve();
-                    options.setSavedCall(null);
-                }
+            @Override public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse response) {
+                if (view == webView && request.isForMainFrame()) pageFailed(response.getStatusCode());
             }
-
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                if (hasListeners("navigationHandler")) {
-                    handleNavigationEvent(url, false);
-                    return true;
-                } else {
-                    options.setTargetUrl(null);
-                    return false;
-                }
+            @Override public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                if (view != webView) return true;
+                if (!hasListeners("navigationHandler")) return false;
+                navigationEvent(url, false);
+                return true;
             }
         };
     }
 
-    private void handlePageLoadError(int errorCode) {
-        JSObject ret = new JSObject();
-        ret.put("errorCode", errorCode);
-        notifyListeners("pageLoadError", ret);
+    private void pageFailed(int errorCode) {
+        // Destroy failed loads so late callbacks cannot settle a subsequent request.
+        if (pendingLoad != null) closeInternal("LOAD_FAILED", "The page failed to load.");
+        else { loading = false; updateVisibility(); }
+        emitLoadError(errorCode);
     }
 
-    private void sendLoadingEvent() {
-        webView.setVisibility(isLoading ? View.INVISIBLE : View.VISIBLE);
-        JSObject result = new JSObject();
-        result.put("isLoading", isLoading);
-        notifyListeners("pageLoaded", result, true);
+    protected void emitLoadError(int errorCode) {
+        notifyListeners("pageLoadError", new JSObject().put("errorCode", errorCode));
+        notifyListeners("pageLoaded", new JSObject().put("isLoading", false), true);
     }
 
-    private void setWebViewOptions(final PluginCall call) {
-        Integer height = call.getInt("height");
-        if (height == null) {
-            call.reject(LOG_TAG, "height is required");
-            return;
-        }
-        options.setHeight(height);
+    private void updateVisibility() { if (webView != null) webView.setVisibility(hidden || loading ? View.INVISIBLE : View.VISIBLE); }
+    protected void loadingEvent() { updateVisibility(); notifyListeners("pageLoaded", new JSObject().put("isLoading", loading), true); }
 
-        Integer width = call.getInt("width");
-        if (width == null) {
-            call.reject(LOG_TAG, "width is required");
-            return;
-        }
-        options.setWidth(width);
-
-        Integer x = call.getInt("x");
-        if (x == null) {
-            call.reject(LOG_TAG, "x coordinate is required");
-            return;
-        }
-        options.setX(x);
-
-        Integer y = call.getInt("y");
-        if (y == null) {
-            call.reject(LOG_TAG, "y coordinate is required");
-            return;
-        }
-        options.setY(y);
-        options.setRatio(2.5f);
-    }
-
-    private void handleNavigationEvent(String url, boolean newWindow) {
-        if (webView != null) {
-            options.setTargetUrl(url);
-            try {
-                URL currentUrl = new URL(webView.getUrl());
-                URL targetUrl = new URL(url);
-                boolean sameHost = currentUrl.getHost().equals(targetUrl.getHost());
-                JSObject ret = new JSObject();
-                ret.put("url", url);
-                ret.put("newWindowRequest", newWindow);
-                ret.put("isSameHost", sameHost);
-
-                notifyListeners("navigationHandler", ret);
-            } catch (MalformedURLException e) {
-                Log.d(LOG_TAG, e.getLocalizedMessage());
-            }
+    private void navigationEvent(String url, boolean newWindow) {
+        if (webView == null) return;
+        try {
+            URI current = new URI(webView.getUrl());
+            URI target = new URI(url);
+            boolean sameHost = current.getHost() != null && current.getHost().equalsIgnoreCase(target.getHost());
+            notifyListeners("navigationHandler", new JSObject().put("url", url).put("newWindowRequest", newWindow).put("isSameHost", sameHost));
+        } catch (Exception ignored) {
+            // Invalid/non-hierarchical targets have no comparable host.
         }
     }
 }

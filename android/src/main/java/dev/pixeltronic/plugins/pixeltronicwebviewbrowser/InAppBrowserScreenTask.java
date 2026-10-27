@@ -1,63 +1,35 @@
 package dev.pixeltronic.plugins.pixeltronicwebviewbrowser;
 
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
-import android.util.Base64;
-import android.webkit.WebView;
-import com.getcapacitor.JSObject;
-import com.getcapacitor.PluginCall;
 import java.io.ByteArrayOutputStream;
-import java.io.IOException;
+import java.util.function.Consumer;
 
-public class InAppBrowserScreenTask implements Runnable {
-    private static final String LOG_TAG = "pixeltronic";
+/** Only encoding runs on the worker. WebView access and drawing stay on the UI thread. */
+final class InAppBrowserScreenTask implements Runnable {
+    private final Bitmap bitmap;
+    private final Consumer<byte[]> success;
+    private final Consumer<Exception> failure;
 
-    private final PluginCall call;
-    private Exception exception;
-    private final WebView webView;
-
-    public InAppBrowserScreenTask(PluginCall call, WebView webView) {
-        this.call = call;
-        this.webView = webView;
+    InAppBrowserScreenTask(Bitmap bitmap, Consumer<byte[]> success, Consumer<Exception> failure) {
+        this.bitmap = bitmap;
+        this.success = success;
+        this.failure = failure;
     }
 
     @Override
     public void run() {
-        final JSObject object = doInBackground();
-        onPostExecute(object);
-    }
-
-    private JSObject doInBackground() {
-        final JSObject object = new JSObject();
-
-        int scrollY = webView.getScrollY();
-
-        webView.setDrawingCacheEnabled(true);
-        final Bitmap bm = Bitmap.createBitmap(webView.getWidth(), webView.getHeight(), Bitmap.Config.ARGB_8888);
-        final Canvas canvas = new Canvas(bm);
-        webView.draw(canvas);
-
-        webView.scrollTo(0, scrollY); // Restore the original scroll position
-        webView.destroyDrawingCache();
-
-        try (ByteArrayOutputStream os = new ByteArrayOutputStream()) {
-            bm.compress(Bitmap.CompressFormat.JPEG, 100, os);
-            byte[] byteArray = os.toByteArray();
-            String src = Base64.encodeToString(byteArray, Base64.DEFAULT);
-
-            object.put("src", src);
-        } catch (IOException e) {
-            exception = e;
+        byte[] bytes;
+        try (ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 100, output)) {
+                throw new IllegalStateException("JPEG encoding failed.");
+            }
+            bytes = output.toByteArray();
+        } catch (Exception ex) {
+            failure.accept(ex);
+            return;
+        } finally {
+            bitmap.recycle();
         }
-
-        return object;
-    }
-
-    private void onPostExecute(JSObject object) {
-        if (exception == null) {
-            call.resolve(object);
-        } else {
-            call.reject(LOG_TAG, "Failed to capture screen.", exception);
-        }
+        success.accept(bytes);
     }
 }
