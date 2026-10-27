@@ -1,3 +1,16 @@
+# Pixeltronic Webview Browser
+
+## Compatibility
+
+This branch targets Capacitor 8.5.3 and later 8.x releases. Capacitor 5–7 apps must upgrade before using it.
+
+- Node.js 22 or later.
+- iOS 15 or later, Xcode 26 or later; CocoaPods and Swift Package Manager are supported.
+- Android API 24 or later; compile/target SDK 36, Java 21, Android Gradle Plugin 8.13.2, Gradle 8.14.3.
+- AndroidX AppCompat 1.8.0, Browser 1.10.0 and CoordinatorLayout 1.3.0; versions remain overridable by the host app.
+
+Install dependencies with npm ci, then run npm run verify:web. Run npm run verify:android with an Android SDK installed and npm run verify:ios on macOS with Xcode and CocoaPods.
+
 ## API
 
 <docgen-index>

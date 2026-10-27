@@ -13,6 +13,7 @@ import type {
   EventListeners,
   PageLoadStatus,
 } from './definitions';
+
 const InAppBrowserPlugin = registerPlugin<NativeInterface>('InAppBrowserPlugin');
 
 export class InAppBrowserClass implements InAppBrowserInterface {

@@ -1,18 +1,9 @@
 import Foundation
+import WebKit
 import Capacitor
 
 typealias JSObject = [String: Any]
 typealias JSArray = [JSObject]
-private extension BrowserEvent {
-    var listenerEvent: String {
-        switch self {
-        case .loaded:
-            return "browserPageLoaded"
-        case .finished:
-            return "browserFinished"
-        }
-    }
-}
 
 private struct Constants {
     static let LOG_TAG = "pixeltronic-webview "
@@ -21,7 +12,22 @@ private struct Constants {
 }
 
 @objc(InAppBrowserPlugin)
-public class InAppBrowserPlugin: CAPPlugin {
+public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
+    public let identifier = "InAppBrowserPlugin"
+    public let jsName = "InAppBrowserPlugin"
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "openWebView", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "closeWebView", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "showWebView", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "hideWebView", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "navigateBack", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "navigateForward", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "refresh", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "loadUrl", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "onNavigation", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "updateDimensions", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "captureScreen", returnType: CAPPluginReturnPromise)
+    ]
     var headers: [String: String]?
     var width: CGFloat!
     var height: CGFloat!
@@ -34,7 +40,7 @@ public class InAppBrowserPlugin: CAPPlugin {
 
     @objc func openWebView(_ call: CAPPluginCall) {
         guard let urlString = call.getString("url"), let url = URL(string: urlString) else {
-            call.reject(Constants.logTag, Constants.invalidURL)
+            call.reject(Constants.LOG_TAG, Constants.INVALID_MISSING_URL_ERROR)
             return
         }
 
@@ -42,7 +48,7 @@ public class InAppBrowserPlugin: CAPPlugin {
         DispatchQueue.main.async {
             self.savedCall = call
             guard let inAppBrowser = self.inAppBrowser, let bridgeViewController = self.bridge?.viewController else {
-                call.reject(Constants.logTag, Constants.noWebviewError)
+                call.reject(Constants.LOG_TAG, Constants.NO_WEBVIEW_ERROR)
                 return
             }
             inAppBrowser.view.frame = CGRect(x: self.x, y: self.y, width: self.width, height: self.height)

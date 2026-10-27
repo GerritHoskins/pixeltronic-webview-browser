@@ -93,7 +93,7 @@ import WebKit
     }
 
     public func loadUrl(_ url: URL) {
-        self.setHeaders(headers: self.plugin.headers!)
+        self.setHeaders()
         self.webview?.customUserAgent = self.customUserAgent ?? self.userAgent ?? self.originalUserAgent
         self.webview?.load(URLRequest(url: url))
     }
