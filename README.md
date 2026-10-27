@@ -13,6 +13,7 @@ The plugin uses `WKWebView` on iOS and `android.webkit.WebView` on Android. The 
 - [Screenshots](#screenshots)
 - [Platform differences](#platform-differences)
 - [API reference](#api-reference)
+- [API migration](#api-migration)
 - [Development](#development)
 
 ## Requirements
@@ -32,7 +33,7 @@ This branch targets Capacitor 8. Upgrade Capacitor 5–7 apps before integrating
 
 ## Installation
 
-Install from a locally built package. The package name `pixeltronic-webview-browser` is not currently available on the public npm registry.
+Build and install a local package from this repository:
 
 First, clone and build the plugin:
 
@@ -90,9 +91,9 @@ async function openBrowser(): Promise<void> {
 // Handle a rejected promise in your app's UI.
 ```
 
-Pass the `HTMLElement` itself, rather than its ID. Although the type declares `element` as optional, the public wrapper requires it on native platforms. Initial coordinates and dimensions are read from `getBoundingClientRect()`.
+Pass the required `HTMLElement` itself, rather than its ID. Initial coordinates and dimensions are read from `getBoundingClientRect()`.
 
-`InAppBrowser` is a shared singleton. Keep one active WebView and close it before opening another. There is no browser/PWA implementation; guard native calls as shown above.
+`InAppBrowser` is a shared singleton. Keep one active WebView and close it before opening another. Browser/PWA calls reject with `UNIMPLEMENTED`; guard native calls as shown above.
 
 ## Navigation and visibility
 
@@ -119,11 +120,33 @@ async function closeBrowser(): Promise<void> {
 }
 ```
 
-`navigateBack()` and `navigateForward()` move through the existing WebView history. `hideWebView()` preserves the view; `closeWebView()` destroys it and disconnects the wrapper's resize observer. Call close when leaving the screen that owns the container.
+`navigateBack()` and `navigateForward()` move through the existing WebView history. `hideWebView()` preserves the view; `closeWebView()` destroys it and removes listeners, layout observers and snapshot resources. Call close when leaving the screen that owns the container.
+
+The default document policy allows HTTPS navigation at the initial origin. Configure exact additional origins before opening when redirects or login pages require them:
+
+```typescript
+import { InAppBrowser } from 'pixeltronic-webview-browser';
+
+async function openTrustedBrowser(element: HTMLElement): Promise<void> {
+  await InAppBrowser.openWebView({
+    url: 'https://example.com',
+    element,
+    navigationPolicy: {
+      allowedOrigins: ['https://example.com', 'https://login.example.com'],
+    },
+  });
+}
+```
+
+Popups, file/content URLs, active schemes and URL credentials are blocked. HTTP document navigation requires `allowHttp: true` and compatible host transport settings; it does not enable mixed content.
+
+This is a **document policy, not network isolation**. Subresources and renderer-managed redirects can send requests before a document callback runs. In the Android emulator regression, a cross-origin HTTP 307 POST redirect sent its body before the final document was blocked. Avoid treating the origin list as a network firewall.
 
 ## Layout updates
 
-The wrapper observes the container with `ResizeObserver` and sends its current bounds when its size changes. Scrolling or moving an element without resizing it needs an explicit update:
+The wrapper coalesces container resizing, captured scroll events, window/visual-viewport resizing and DOM layout notifications. Native attachment tracks the host WebView's position and size. Detached, zero-sized and offscreen containers hide the native view until usable again.
+
+To force a remeasurement, call `updateDimensions()` without arguments. For explicit CSS bounds:
 
 ```typescript
 import { InAppBrowser } from 'pixeltronic-webview-browser';
@@ -132,15 +155,15 @@ async function syncBrowserBounds(element: HTMLElement): Promise<void> {
   const { width, height, x, y } = element.getBoundingClientRect();
 
   await InAppBrowser.updateDimensions({
-    width: Math.round(width),
-    height: Math.round(height),
-    x: Math.round(x),
-    y: Math.round(y),
+    width: width,
+    height: height,
+    x: x,
+    y: y,
   });
 }
 ```
 
-Send all four values on each manual update. Keep the element mounted while the native view is open. Its native counterpart does not inherit DOM clipping, transforms, or CSS stacking behavior.
+Send all four values on each manual update. Fractional CSS coordinates are preserved until native conversion. Viewport clipping is supported, but arbitrary DOM ancestor clipping, transforms, CSS stacking and continuous animation are not reproduced by a native overlay. Device visual checks are still needed for rotation, keyboards and app-specific insets.
 
 ## Page events
 
@@ -150,22 +173,26 @@ Register listeners once, before opening the WebView, to observe loading and erro
 import { Capacitor } from '@capacitor/core';
 import { InAppBrowser } from 'pixeltronic-webview-browser';
 
-async function registerBrowserEvents(): Promise<void> {
-  if (!Capacitor.isNativePlatform()) return;
+async function registerBrowserEvents(): Promise<() => Promise<void>> {
+  if (!Capacitor.isNativePlatform()) return async () => {};
 
-  await InAppBrowser.onPageLoaded(({ isLoading }) => {
+  const loading = await InAppBrowser.onPageLoaded(({ isLoading }) => {
     console.log(isLoading ? 'Loading page' : 'Loading finished');
   });
 
-  await InAppBrowser.onPageLoadError(({ errorCode }) => {
+  const errors = await InAppBrowser.onPageLoadError(({ errorCode }) => {
     console.error('WebView load error:', errorCode);
   });
+
+  return async () => {
+    await Promise.all([loading.remove(), errors.remove()]);
+  };
 }
 ```
 
 Despite its name, `onPageLoaded()` reports both loading states. Error codes are platform-specific: Android reports WebView errors and HTTP status codes, while iOS reports native navigation error codes.
 
-The listener helpers return `Promise<void>`, with no unsubscribe handle. The current wrapper does not retain the handles needed to remove these listeners on close. Re-registering on every open can accumulate callbacks.
+Every listener helper returns a `PluginListenerHandle`. Await `handle.remove()` to unsubscribe independently; concurrent or repeated removal is safe. Close also removes retained handles and suppresses queued callbacks. Register new listeners for a new session after close.
 
 ## Screenshots
 
@@ -183,83 +210,87 @@ async function resumeLiveView(): Promise<void> {
 }
 ```
 
-Call this after opening and loading the page. The public method returns no image data. Its promise can resolve before the image finishes loading and visibility switches; it is not a signal that the snapshot is already displayed. A screenshot is static and cannot receive page interactions.
+Call this after opening and loading the page. The public method returns no image data. Its promise waits for image decoding and the native visibility switch. Captures use JPEG quality 85% with a maximum edge of 2048 pixels. `captureScreen(false)` restores the live view without recapturing, restores owned background styles and releases the object URL. Manual visibility, loading and layout visibility remain independent. A screenshot is static and cannot receive page interactions.
 
 ## Platform differences
 
-These limitations reflect the current implementation:
+| Feature                | iOS and Android behavior                                                                                                                                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `headers`              | Initial and explicit `loadUrl()` requests receive custom headers only at the initial origin; User-Agent applies to the session. Redirects, subresources, history and reload are platform-managed and have no custom-header guarantee. |
+| `onNavigation()`       | Observes `allowed`, `reason`, `isMainFrame` and URL metadata after a native decision. Callbacks cannot stall or override it.                                                                                                          |
+| `onUpdateDimensions()` | Reports applied layout changes as `{ width, height, x, y }` in CSS pixels.                                                                                                                                                            |
+| Native overlay         | Appears above the host's HTML. Use a snapshot when HTML controls must cover it.                                                                                                                                                       |
 
-| Feature                | iOS                                                                                                      | Android                                                                                                |
-| ---------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `headers`              | Applies `User-Agent`; other custom headers are not attached to requests                                  | Headers are stored on open and applied by subsequent `loadUrl()` calls; the initial open bypasses them |
-| `onNavigation()`       | Calls `event.complete(true)` to allow or `event.complete(false)` to cancel a pending navigation response | Emits navigation events, but `complete()` does not currently resume or cancel the pending URL          |
-| `colorScheme`          | Declared in the types but not forwarded by the public wrapper                                            | Declared in the types but not forwarded by the public wrapper                                          |
-| `onUpdateDimensions()` | Declared, but no corresponding native event is emitted                                                   | Declared, but no corresponding native event is emitted                                                 |
-
-Register `onNavigation()` only when you need to intercept navigation and have verified the behavior on your target platform. On iOS, resolve each callback with `event.complete(...)` so the response can proceed or be cancelled. This callback is not a cross-platform navigation security boundary.
-
-The native view appears above HTML content. Use the screenshot helper when an HTML overlay must cover it. The Android WebView enables JavaScript, file access, and mixed content; load content appropriate for your app's trust model.
+The legacy `event.complete()` method always rejects with `UNIMPLEMENTED`. Configure `navigationPolicy` instead. Android disables file/content access, file-origin cross-origin access and mixed content.
 
 ## API reference
 
-Import the public singleton as `InAppBrowser`. All methods below return `Promise<void>`.
+Import the public singleton as `InAppBrowser`. Commands return `Promise<void>`; the four listener helpers return `Promise<PluginListenerHandle>`.
 
-| Method                                      | Purpose                                                                             |
-| ------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `openWebView(options)`                      | Create the native view and load a URL using the container's bounds                  |
-| `closeWebView()`                            | Destroy the current native view                                                     |
-| `showWebView()` / `hideWebView()`           | Change visibility without destroying the view                                       |
-| `navigateBack()` / `navigateForward()`      | Navigate through page history                                                       |
-| `loadUrl({ url })`                          | Load a URL in the existing view                                                     |
-| `reload()`                                  | Reload the current page                                                             |
-| `updateDimensions({ width, height, x, y })` | Update the native view's bounds                                                     |
-| `onPageLoaded(callback)`                    | Observe `{ isLoading: boolean }`                                                    |
-| `onPageLoadError(callback)`                 | Observe `{ errorCode: number }`                                                     |
-| `onNavigation(callback)`                    | Observe `{ url, newWindowRequest, isSameHost, complete }`; see platform differences |
-| `onUpdateDimensions(callback)`              | Declared resize-event listener; currently not emitted by native code                |
-| `captureScreen(showScreenCapture)`          | Switch between a snapshot background and the live view                              |
+| Method                                      | Purpose                                                                       |
+| ------------------------------------------- | ----------------------------------------------------------------------------- |
+| `openWebView(options)`                      | Create the native view and load a URL using the container's bounds            |
+| `closeWebView()`                            | Destroy the current native view                                               |
+| `showWebView()` / `hideWebView()`           | Change visibility without destroying the view                                 |
+| `navigateBack()` / `navigateForward()`      | Navigate through page history                                                 |
+| `loadUrl({ url })`                          | Load a URL in the existing view                                               |
+| `reload()`                                  | Reload the current page                                                       |
+| `updateDimensions({ width, height, x, y })` | Update the native view's bounds                                               |
+| `onPageLoaded(callback)`                    | Observe `{ isLoading: boolean }`                                              |
+| `onPageLoadError(callback)`                 | Observe `{ errorCode: number }`                                               |
+| `onNavigation(callback)`                    | Observe `{ url, newWindowRequest, isSameHost, isMainFrame, allowed, reason }` |
+| `onUpdateDimensions(callback)`              | Observe applied CSS bounds                                                    |
+| `captureScreen(showScreenCapture)`          | Switch between a snapshot background and the live view                        |
 
 ### Open options
 
-| Option                               | Type                        | Behavior                                                                    |
-| ------------------------------------ | --------------------------- | --------------------------------------------------------------------------- |
-| `url`                                | `string`                    | Required URL to load                                                        |
-| `element`                            | `HTMLElement`               | Required by the wrapper on native platforms; supplies the view's bounds     |
-| `headers`                            | `{ [key: string]: string }` | Optional headers; see platform differences                                  |
-| `colorScheme`                        | `ColorScheme`               | Declared option with no effect through the current wrapper                  |
-| `width`, `height`, `x`, `y`, `ratio` | `number`                    | Inherited type fields; `openWebView()` uses measured element bounds instead |
+| Option             | Type                        | Behavior                                                                |
+| ------------------ | --------------------------- | ----------------------------------------------------------------------- |
+| `url`              | `string`                    | Required URL to load                                                    |
+| `element`          | `HTMLElement`               | Required by the wrapper on native platforms; supplies the view's bounds |
+| `headers`          | `{ [key: string]: string }` | Optional headers; see platform differences                              |
+| `navigationPolicy` | `NavigationPolicy`          | Optional exact document origins and HTTP opt-in                         |
 
-For the complete type declarations, see [src/definitions.ts](src/definitions.ts). Some native-facing declarations, including `openSystemBrowser()` and `openBrowser()`, are not implemented by the public singleton and should not be used as public features.
+For the public types, see [src/definitions.ts](src/definitions.ts). DOM options are separate from internal, serializable native payloads.
+
+## API migration
+
+- `element` is required in `OpenOptions`; it was already required at runtime. Initial bounds come from that element.
+- Manual `Dimensions` require all four fields. Omit the argument to remeasure. `ratio` and viewport metadata are internal.
+- Listener registrations now return removable handles. Code that awaits and ignores the result continues to work.
+- Unsupported `colorScheme` and initial bounds fields were removed from `OpenOptions`. The exported `ColorScheme` type remains deprecated for migration.
+- Unimplemented native methods and `updateScreenCapture` were removed from declarations. `NativeInterface` is internal; use the singleton's public API.
+- `NavigationEvent.complete()` and the raw `ScreenShot` type remain deprecated compatibility declarations.
+
+These declaration changes can require updates to explicitly annotated consumer code. No package version was changed or release published as part of this cleanup.
 
 ## Development
 
 ```sh
 npm ci
 npm run verify:web
-npm run eslint
 ```
 
-Run Android verification with an installed Android SDK and Java 21:
+The web gate builds fresh bundles, runs wrapper regressions and strict declaration tests, checks ESLint, validates README examples/links, and checks package contents. The package check rejects missing entry points/native sources and accidental inclusion of Android test transport exceptions.
+
+With Java 21, Android SDK 36 and a connected emulator/device:
 
 ```sh
 npm run verify:android
 ```
 
-On Windows PowerShell, invoke the wrapper directly:
+This runs debug/release builds, JVM tests, lint with errors enforced, and instrumentation. `npm run verify:android:unit` omits instrumentation and reports that explicitly. The launcher supports Windows and Unix.
 
-```powershell
-Set-Location android
-.\gradlew.bat clean build test
-```
-
-Run iOS verification on macOS with Xcode and CocoaPods:
+On macOS with Xcode, an installed iOS simulator runtime and CocoaPods:
 
 ```sh
 npm run verify:ios
 ```
 
-`npm run verify` runs iOS, Android, and web verification in sequence. `npm run build` generates the web bundle and `dist/docs.json`. This README is maintained manually so it can explain implementation limits alongside the declared API.
+This builds the CocoaPods workspace and Swift package for iOS, then runs each test suite on an available iPhone simulator. Set `IOS_SIMULATOR_UDID` to select one. Result bundles are retained under `.build/release-gates/`. The command fails on unsupported hosts; it never reports skipped native checks as a pass.
 
-The Capacitor 8 upgrade was checked with the web build and Android debug/release builds. An iOS/Xcode build and device behavior still need validation. Android's current unit-test tasks contain no test sources.
+`npm run verify:release` (also `npm run verify`) requires all web, Android and iOS gates to pass. It does not publish, commit or push. Native build scripts require their platform tools and do not transfer source to another machine. CocoaPods/SPM resolution may create local lockfiles; review these separately.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow. The package declares an MIT license in [package.json](package.json).
+The current local evidence includes wrapper and Android tests. The iOS sources, tests and these Xcode commands remain **uncompiled and unrun** in the Windows-only validation environment. Android geometry and screenshot-dimension tests do not replace visual acceptance on devices.
+
+This README is maintained manually; docgen produces `dist/docs.json` without replacing its sections. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.

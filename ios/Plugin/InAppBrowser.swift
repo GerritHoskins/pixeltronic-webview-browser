@@ -80,6 +80,9 @@ private final class BrowserClipView: UIView {
 
     func applyLayout() throws {
         guard isViewLoaded, let layout = layout else { return }
+        let oldFrame = webview?.frame
+        let oldContainerFrame = view.frame
+        let oldClipHeight = viewportHeight?.constant
         if let host = host, host.bounds.width > 0 {
             let projected = try layout.project(host: host.bounds.size)
             if viewportHeight?.constant != projected.clip.height { viewportHeight?.constant = projected.clip.height }
@@ -91,6 +94,12 @@ private final class BrowserClipView: UIView {
         }
         geometryReady = true
         updateVisibility()
+        if oldFrame != webview?.frame || oldContainerFrame != view.frame || oldClipHeight != viewportHeight?.constant {
+            plugin?.notifyEventListeners(eventName: "updateDimensions", eventValue: [
+                "width": layout.rect.width, "height": layout.rect.height,
+                "x": layout.rect.origin.x, "y": layout.rect.origin.y
+            ])
+        }
     }
 
     @discardableResult func loadUrl(_ url: URL) -> WKNavigation? {

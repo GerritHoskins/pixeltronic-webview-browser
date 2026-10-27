@@ -50,6 +50,10 @@ final class InAppBrowserTests: XCTestCase {
 
     private final class PluginHarness: InAppBrowserPlugin {
         var browser: Browser?
+        var layoutEvents: [[String: Any]] = []
+        override func notifyEventListeners(eventName: String, eventValue: [String: Any]) {
+            if eventName == "updateDimensions" { layoutEvents.append(eventValue) }
+        }
         override func makeBrowser(headers: [String: String], policy: BrowserNavigationPolicy) -> InAppBrowser {
             XCTAssertTrue(Thread.isMainThread)
             let browser = Browser(self, configuration: WKWebViewConfiguration(), headers: headers, policy: policy)
@@ -97,6 +101,23 @@ final class InAppBrowserTests: XCTestCase {
         let close = Record()
         plugin.closeWebView(close.call()); plugin.closeWebView(close.call()); await drain()
         XCTAssertEqual(close.successes, 2); XCTAssertTrue(close.errors.isEmpty)
+    }
+
+    func testAppliedLayoutEmitsTypedCssBoundsWithoutDuplicateEvents() async {
+        let plugin = PluginHarness(); _ = await open(plugin); finish(plugin)
+        guard let browser = plugin.browser else { XCTFail("No browser"); return }
+        plugin.layoutEvents.removeAll()
+        let resize = Record()
+        plugin.updateDimensions(resize.call(["width": 120.25, "height": 240.5, "x": -10.5, "y": 25.75]))
+        await drain()
+        XCTAssertEqual(resize.successes, 1); XCTAssertEqual(plugin.layoutEvents.count, 1)
+        XCTAssertEqual(plugin.layoutEvents.first?["width"] as? CGFloat, 120.25)
+        XCTAssertEqual(plugin.layoutEvents.first?["y"] as? CGFloat, 25.75)
+        let again = Record()
+        plugin.updateDimensions(again.call(["width": 120.25, "height": 240.5, "x": -10.5, "y": 25.75]))
+        await drain()
+        XCTAssertEqual(plugin.layoutEvents.count, 1)
+        plugin.tearDownBrowser()
     }
 
     func testManualLayoutAndSnapshotVisibilityRemainIndependent() async {

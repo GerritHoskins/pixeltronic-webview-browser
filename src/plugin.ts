@@ -3,25 +3,22 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 import ResizeObserver from 'resize-observer-polyfill';
 
 import type {
-  NativeInterface,
   InAppBrowserInterface,
   Dimensions,
   OpenOptions,
   NavigationEvent,
   ErrorCode,
   EventListeners,
+  BrowserEventMap,
   PageLoadStatus,
   NavigationPolicy,
 } from './definitions';
+import type { NativeInterface, NativeBounds, ViewportMetrics } from './native';
 
 const InAppBrowserPlugin =
   registerPlugin<NativeInterface>('InAppBrowserPlugin');
 type State = 'closed' | 'opening' | 'open' | 'closing' | 'failed';
-type Bounds = Required<Pick<Dimensions, 'width' | 'height' | 'x' | 'y'>> &
-  Pick<
-    Dimensions,
-    'viewportWidth' | 'viewportHeight' | 'offsetLeft' | 'offsetTop'
-  >;
+type Bounds = NativeBounds;
 
 function failure(code: string, message: string): Error {
   return Object.assign(new Error(message), { code });
@@ -94,9 +91,13 @@ export class InAppBrowserClass implements InAppBrowserInterface {
           ++this.listenerGeneration;
           this.clearViewResources();
           const handles = [...this.listeners];
-          this.listeners.clear();
-          void Promise.all(handles.map(handle => handle.remove())).catch(
-            error => console.error('WebView listener cleanup failed.', error),
+          void Promise.all(
+            handles.map(async handle => {
+              await handle.remove();
+              this.listeners.delete(handle);
+            }),
+          ).catch(error =>
+            console.error('WebView listener cleanup failed.', error),
           );
         },
       );
@@ -170,8 +171,12 @@ export class InAppBrowserClass implements InAppBrowserInterface {
           }
         } finally {
           const listeners = [...this.listeners];
-          this.listeners.clear();
-          await Promise.all(listeners.map(listener => listener.remove()));
+          await Promise.all(
+            listeners.map(async listener => {
+              await listener.remove();
+              this.listeners.delete(listener);
+            }),
+          );
         }
       } finally {
         // Preserve the ability to retry native cleanup if the bridge close failed.
@@ -230,17 +235,14 @@ export class InAppBrowserClass implements InAppBrowserInterface {
     await InAppBrowserPlugin.refresh();
   }
 
-  async updateDimensions(dimensions: Dimensions): Promise<void> {
+  async updateDimensions(dimensions?: Dimensions): Promise<void> {
     this.requireOpen();
     const bounds =
       dimensions === undefined
         ? this.getDimensions(this.element)
         : this.validateBounds({ ...this.viewportMetrics(), ...dimensions });
     const generation = this.generation;
-    await InAppBrowserPlugin.updateDimensions({
-      ...bounds,
-      ratio: window.devicePixelRatio,
-    });
+    await InAppBrowserPlugin.updateDimensions(bounds);
     if (generation !== this.generation)
       throw failure('CANCELLED', 'The WebView was closed.');
     this.lastBounds = bounds;
@@ -262,8 +264,11 @@ export class InAppBrowserClass implements InAppBrowserInterface {
 
   async onNavigation(
     listener: (event: NavigationEvent) => void,
-  ): Promise<void> {
-    await this.addListener('navigationHandler', event =>
+  ): Promise<PluginListenerHandle> {
+    this.requireNative();
+    if (typeof listener !== 'function')
+      throw failure('INVALID_ARGUMENT', 'An event callback is required.');
+    return this.addListener('navigationHandler', event =>
       listener({
         ...event,
         complete: () =>
@@ -277,18 +282,22 @@ export class InAppBrowserClass implements InAppBrowserInterface {
     );
   }
 
-  async onPageLoadError(listener: (error: ErrorCode) => void): Promise<void> {
-    await this.addListener('pageLoadError', listener);
+  async onPageLoadError(
+    listener: (error: ErrorCode) => void,
+  ): Promise<PluginListenerHandle> {
+    return this.addListener('pageLoadError', listener);
   }
 
   async onPageLoaded(
     listener: (status: PageLoadStatus) => void,
-  ): Promise<void> {
-    await this.addListener('pageLoaded', listener);
+  ): Promise<PluginListenerHandle> {
+    return this.addListener('pageLoaded', listener);
   }
 
-  async onUpdateDimensions(listener: () => void): Promise<void> {
-    await this.addListener('updateDimensions', listener);
+  async onUpdateDimensions(
+    listener: (bounds: Dimensions) => void,
+  ): Promise<PluginListenerHandle> {
+    return this.addListener('updateDimensions', listener);
   }
 
   async captureScreen(showScreenCapture: boolean): Promise<void> {
@@ -392,25 +401,53 @@ export class InAppBrowserClass implements InAppBrowserInterface {
     }
   }
 
-  private async addListener(
-    event: EventListeners,
-    listener: (...args: any[]) => void,
-  ): Promise<void> {
+  private async addListener<K extends EventListeners>(
+    event: K,
+    listener: (value: BrowserEventMap[K]) => void,
+  ): Promise<PluginListenerHandle> {
     this.requireNative();
     if (typeof listener !== 'function')
       throw failure('INVALID_ARGUMENT', 'An event callback is required.');
     if (this.state === 'closing')
       throw failure('BUSY', 'The WebView is closing.');
     const generation = this.listenerGeneration;
-    const handle = await InAppBrowserPlugin.addListener(event, listener);
+    let active = true;
+    const handle = await InAppBrowserPlugin.addListener(event, value => {
+      if (active && generation === this.listenerGeneration) listener(value);
+    });
+    let removed = false;
+    let removing: Promise<void> | undefined;
+    const owned: PluginListenerHandle = {
+      remove: () => {
+        active = false; // Suppress queued callbacks even when native removal needs a retry.
+        if (removed) return Promise.resolve();
+        if (!removing) {
+          removing = Promise.resolve()
+            .then(() => handle.remove())
+            .then(
+              () => {
+                removed = true;
+                this.listeners.delete(owned);
+                removing = undefined;
+              },
+              error => {
+                removing = undefined;
+                throw error;
+              },
+            );
+        }
+        return removing;
+      },
+    };
     if (generation !== this.listenerGeneration) {
-      await handle.remove();
+      await owned.remove();
       throw failure(
         'CANCELLED',
         'The listener was registered while the WebView was closing.',
       );
     }
-    this.listeners.add(handle);
+    this.listeners.add(owned);
+    return owned;
   }
 
   private requireNative(): void {
@@ -537,7 +574,7 @@ export class InAppBrowserClass implements InAppBrowserInterface {
       );
   }
 
-  private validateBounds(bounds: Dimensions): Bounds {
+  private validateBounds(bounds: NativeBounds): Bounds {
     if (
       !bounds ||
       ['width', 'height', 'x', 'y'].some(
@@ -560,12 +597,7 @@ export class InAppBrowserClass implements InAppBrowserInterface {
     };
   }
 
-  private validateViewport(
-    bounds: Dimensions,
-  ): Pick<
-    Bounds,
-    'viewportWidth' | 'viewportHeight' | 'offsetLeft' | 'offsetTop'
-  > {
+  private validateViewport(bounds: ViewportMetrics): ViewportMetrics {
     for (const key of [
       'viewportWidth',
       'viewportHeight',
@@ -592,10 +624,7 @@ export class InAppBrowserClass implements InAppBrowserInterface {
     };
   }
 
-  private viewportMetrics(): Pick<
-    Bounds,
-    'viewportWidth' | 'viewportHeight' | 'offsetLeft' | 'offsetTop'
-  > {
+  private viewportMetrics(): ViewportMetrics {
     const viewport = window.visualViewport;
     const width = viewport?.width ?? window.innerWidth;
     const height = viewport?.height ?? window.innerHeight;

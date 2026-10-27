@@ -36,7 +36,8 @@ android {
         }
     }
     lintOptions {
-        abortOnError = false
+        // Release gates must fail on lint errors, while preserving the normal host build setting.
+        abortOnError = project.hasProperty('browserReleaseGate')
     }
     testOptions {
         unitTests.returnDefaultValues = true

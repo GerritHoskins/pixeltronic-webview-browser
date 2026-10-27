@@ -62,6 +62,55 @@ function setup({ observeFailure = false, layout = false } = {}) {
 const code = expected => error => error.code === expected;
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
+test('every public event returns an independently removable handle', async () => {
+  const s = setup(); const callbacks = new Map(); let removed = 0, received = 0;
+  s.backend.addListener = async (name, callback) => {
+    callbacks.set(name, callback); return { remove: async () => { removed++; } };
+  };
+  for (const [method, name, payload] of [
+    ['onPageLoaded', 'pageLoaded', { isLoading: true }],
+    ['onPageLoadError', 'pageLoadError', { errorCode: 500 }],
+    ['onUpdateDimensions', 'updateDimensions', { width: 10, height: 20, x: 0, y: 0 }],
+    ['onNavigation', 'navigationHandler', { allowed: true, reason: 'ALLOWED' }],
+  ]) {
+    const handle = await s.plugin[method](() => { received++; });
+    callbacks.get(name)(payload); assert.equal(received, removed + 1);
+    await Promise.all([handle.remove(), handle.remove()]);
+    callbacks.get(name)(payload); assert.equal(received, removed);
+    await handle.remove();
+  }
+  await s.plugin.closeWebView(); assert.equal(removed, 4);
+});
+
+test('one listener can be removed while another remains active; close suppresses queued callbacks', async () => {
+  const s = setup(); const callbacks = []; let removes = 0, a = 0, b = 0;
+  s.backend.addListener = async (_, callback) => { callbacks.push(callback); return { remove: async () => { removes++; } }; };
+  const first = await s.plugin.onPageLoaded(() => { a++; });
+  await s.plugin.onPageLoaded(() => { b++; });
+  await first.remove(); callbacks.forEach(callback => callback({ isLoading: false }));
+  assert.equal(a, 0); assert.equal(b, 1);
+  await s.plugin.closeWebView(); callbacks.forEach(callback => callback({ isLoading: false }));
+  assert.equal(a, 0); assert.equal(b, 1); assert.equal(removes, 2);
+});
+
+test('failed listener removal can be retried and suppresses callbacks immediately', async () => {
+  const s = setup(); let emit, attempts = 0, received = 0;
+  s.backend.addListener = async (_, callback) => {
+    emit = callback; return { remove: () => { if (++attempts === 1) throw new Error('remove failed'); } };
+  };
+  const handle = await s.plugin.onPageLoaded(() => { received++; });
+  await assert.rejects(handle.remove(), /remove failed/); emit({ isLoading: true }); assert.equal(received, 0);
+  await handle.remove(); await s.plugin.closeWebView(); assert.equal(attempts, 2);
+});
+
+test('invalid event callbacks reject at registration', async () => {
+  const s = setup();
+  for (const method of ['onPageLoaded', 'onPageLoadError', 'onNavigation', 'onUpdateDimensions']) {
+    await assert.rejects(s.plugin[method](null), code('INVALID_ARGUMENT'));
+  }
+  assert.equal(s.calls.length, 0);
+});
+
 test('scroll and viewport events coalesce, preserve CSS fractions and detach cleanly', async () => {
   const s = setup({ layout: true }); await s.open();
   s.element.getBoundingClientRect = () => ({ width: 300.25, height: 400.5, x: 11.5, y: 22.75 });
@@ -258,12 +307,14 @@ test('listeners are removed on close, including registrations completed after cl
 
 test('close still reaches native and clears state when listener removal fails', async () => {
   const { backend, plugin, calls, open } = setup();
-  backend.addListener = async () => ({ remove: async () => { throw new Error('removal failed'); } });
+  let attempts = 0;
+  backend.addListener = async () => ({ remove: async () => { if (++attempts === 1) throw new Error('removal failed'); } });
   await plugin.onPageLoaded(() => {});
   await open();
   await assert.rejects(plugin.closeWebView(), /removal failed/);
   assert.equal(calls.filter(call => call[0] === 'closeWebView').length, 1);
   await plugin.closeWebView();
+  assert.equal(attempts, 4); // Three registrations, plus retry of the failed removal.
 });
 
 test('failure after native opening rolls the native view back', async () => {
