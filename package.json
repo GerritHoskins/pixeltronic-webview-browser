@@ -1,6 +1,6 @@
 {
-  "name": "pixeltronic-webview-browser",
-  "version": "5.0.4",
+  "name": "@gerrithoskins/pixeltronic-webview-browser",
+  "version": "0.0.1",
   "description": "capacitor plugin for delegating native web views",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
@@ -15,10 +15,14 @@
     "Package.swift",
     "ios/PluginTests/"
   ],
-  "author": "",
+  "author": "Gerrit Hoskins",
   "license": "MIT",
   "repository": {
-    "url": "https://github.com/GerritHoskins/pixeltronic-webview-browser"
+	"type": "git",
+    "url": "git+https://github.com/GerritHoskins/pixeltronic-webview-browser.git"
+  },
+    "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "capacitor",
