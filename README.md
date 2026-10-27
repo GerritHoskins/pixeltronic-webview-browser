@@ -1,296 +1,265 @@
 # Pixeltronic Webview Browser
 
-## Compatibility
+Embed a native WebView inside an iOS or Android Capacitor app, positioned to match an HTML element. Control navigation, visibility, page loading, and screenshots through a TypeScript API.
 
-This branch targets Capacitor 8.5.3 and later 8.x releases. Capacitor 5–7 apps must upgrade before using it.
+The plugin uses `WKWebView` on iOS and `android.webkit.WebView` on Android. The native view sits above the app's web content; the HTML element supplies its position and dimensions.
 
-- Node.js 22 or later.
-- iOS 15 or later, Xcode 26 or later; CocoaPods and Swift Package Manager are supported.
-- Android API 24 or later; compile/target SDK 36, Java 21, Android Gradle Plugin 8.13.2, Gradle 8.14.3.
-- AndroidX AppCompat 1.8.0, Browser 1.10.0 and CoordinatorLayout 1.3.0; versions remain overridable by the host app.
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Navigation and visibility](#navigation-and-visibility)
+- [Layout updates](#layout-updates)
+- [Page events](#page-events)
+- [Screenshots](#screenshots)
+- [Platform differences](#platform-differences)
+- [API reference](#api-reference)
+- [Development](#development)
 
-Install dependencies with npm ci, then run npm run verify:web. Run npm run verify:android with an Android SDK installed and npm run verify:ios on macOS with Xcode and CocoaPods.
+## Requirements
 
-## API
+| Component              | Requirement                                                |
+| ---------------------- | ---------------------------------------------------------- |
+| Capacitor              | `8.5.3` or a later compatible `8.x` release                |
+| Node.js                | `22` or later                                              |
+| iOS                    | iOS `15` or later; Xcode `26` or later                     |
+| iOS dependency manager | CocoaPods or Swift Package Manager                         |
+| Android                | API `24` or later; compile/target SDK `36`                 |
+| Android build tools    | Java `21`, Android Gradle Plugin `8.13.2`, Gradle `8.14.3` |
 
-<docgen-index>
+The Android module defaults to AppCompat `1.8.0`, Browser `1.10.0`, and CoordinatorLayout `1.3.0`. Host apps can override the versions through the corresponding Gradle project properties.
 
-* [`openWebView(...)`](#openwebview)
-* [`closeWebView()`](#closewebview)
-* [`hideWebView()`](#hidewebview)
-* [`showWebView()`](#showwebview)
-* [`navigateBack()`](#navigateback)
-* [`navigateForward()`](#navigateforward)
-* [`loadUrl(...)`](#loadurl)
-* [`reload()`](#reload)
-* [`onNavigation(...)`](#onnavigation)
-* [`onPageLoaded(...)`](#onpageloaded)
-* [`onPageLoadError(...)`](#onpageloaderror)
-* [`onUpdateDimensions(...)`](#onupdatedimensions)
-* [`captureScreen(...)`](#capturescreen)
-* [`updateDimensions(...)`](#updatedimensions)
-* [Interfaces](#interfaces)
-* [Type Aliases](#type-aliases)
+This branch targets Capacitor 8. Upgrade Capacitor 5–7 apps before integrating it. The plugin's own package version (`5.0.4`) is separate from its Capacitor compatibility requirement.
 
-</docgen-index>
+## Installation
 
-<docgen-api>
-<!--Update the source file JSDoc comments and rerun docgen to update the docs below-->
+Install from a locally built package. The package name `pixeltronic-webview-browser` is not currently available on the public npm registry.
 
-### openWebView(...)
+First, clone and build the plugin:
 
-```typescript
-openWebView(options: OpenOptions) => Promise<void>
+```sh
+git clone https://github.com/GerritHoskins/pixeltronic-webview-browser.git
+cd pixeltronic-webview-browser
+npm ci
+npm run build
+npm pack
 ```
 
-Open a URL inside the webview or show a hidden webview
-Should only be called after createWebView has finished successfully
-optional headers can be set here as well for example User-Agent
+Then, from your Capacitor app directory, install the generated tarball and sync the native projects:
 
-| Param         | Type                                                |
-| ------------- | --------------------------------------------------- |
-| **`options`** | <code><a href="#openoptions">OpenOptions</a></code> |
-
---------------------
-
-
-### closeWebView()
-
-```typescript
-closeWebView() => Promise<void>
+```sh
+npm install /path/to/pixeltronic-webview-browser/pixeltronic-webview-browser-5.0.4.tgz
+npx cap sync
 ```
 
-Close and destroy an open webview.
+Replace the path with the tarball's actual location. Build the plugin before packing it: the package entry points use the generated `dist/` directory. Rebuild your native app after syncing.
 
---------------------
+## Quick start
 
+Create a visible container with nonzero dimensions:
 
-### hideWebView()
-
-```typescript
-hideWebView() => Promise<void>
+```html
+<div id="browser-container" aria-label="Embedded web content"></div>
 ```
 
-Hides the current webview.
-
---------------------
-
-
-### showWebView()
-
-```typescript
-showWebView() => Promise<void>
+```css
+#browser-container {
+  width: 100%;
+  height: 400px;
+}
 ```
 
-Shows the current webview.
-
---------------------
-
-
-### navigateBack()
+Open the WebView after the element has mounted and layout is ready:
 
 ```typescript
-navigateBack() => Promise<void>
+import { Capacitor } from '@capacitor/core';
+import { InAppBrowser } from 'pixeltronic-webview-browser';
+
+async function openBrowser(): Promise<void> {
+  if (!Capacitor.isNativePlatform()) return;
+
+  const element = document.getElementById('browser-container');
+  if (!element) throw new Error('Browser container is missing');
+
+  await InAppBrowser.openWebView({
+    url: 'https://example.com',
+    element,
+  });
+}
+
+// Call from your framework's mounted/view-ready hook or a user action.
+// Handle a rejected promise in your app's UI.
 ```
 
-Handle back navigation inside the webview
+Pass the `HTMLElement` itself, rather than its ID. Although the type declares `element` as optional, the public wrapper requires it on native platforms. Initial coordinates and dimensions are read from `getBoundingClientRect()`.
 
---------------------
+`InAppBrowser` is a shared singleton. Keep one active WebView and close it before opening another. There is no browser/PWA implementation; guard native calls as shown above.
 
+## Navigation and visibility
 
-### navigateForward()
+Use these controls after opening a WebView:
 
 ```typescript
-navigateForward() => Promise<void>
+import { InAppBrowser } from 'pixeltronic-webview-browser';
+
+async function navigate(): Promise<void> {
+  await InAppBrowser.loadUrl({ url: 'https://example.com/help' });
+  await InAppBrowser.reload();
+}
+
+async function showBrowser(): Promise<void> {
+  await InAppBrowser.showWebView();
+}
+
+async function hideBrowser(): Promise<void> {
+  await InAppBrowser.hideWebView();
+}
+
+async function closeBrowser(): Promise<void> {
+  await InAppBrowser.closeWebView();
+}
 ```
 
-Handle forward navigation inside the webview
+`navigateBack()` and `navigateForward()` move through the existing WebView history. `hideWebView()` preserves the view; `closeWebView()` destroys it and disconnects the wrapper's resize observer. Call close when leaving the screen that owns the container.
 
---------------------
+## Layout updates
 
-
-### loadUrl(...)
+The wrapper observes the container with `ResizeObserver` and sends its current bounds when its size changes. Scrolling or moving an element without resizing it needs an explicit update:
 
 ```typescript
-loadUrl(options: { url: string; }) => Promise<void>
+import { InAppBrowser } from 'pixeltronic-webview-browser';
+
+async function syncBrowserBounds(element: HTMLElement): Promise<void> {
+  const { width, height, x, y } = element.getBoundingClientRect();
+
+  await InAppBrowser.updateDimensions({
+    width: Math.round(width),
+    height: Math.round(height),
+    x: Math.round(x),
+    y: Math.round(y),
+  });
+}
 ```
 
-Load a specified URL in an existing webview.
+Send all four values on each manual update. Keep the element mounted while the native view is open. Its native counterpart does not inherit DOM clipping, transforms, or CSS stacking behavior.
 
-| Param         | Type                          |
-| ------------- | ----------------------------- |
-| **`options`** | <code>{ url: string; }</code> |
+## Page events
 
---------------------
-
-
-### reload()
+Register listeners once, before opening the WebView, to observe loading and errors:
 
 ```typescript
-reload() => Promise<void>
+import { Capacitor } from '@capacitor/core';
+import { InAppBrowser } from 'pixeltronic-webview-browser';
+
+async function registerBrowserEvents(): Promise<void> {
+  if (!Capacitor.isNativePlatform()) return;
+
+  await InAppBrowser.onPageLoaded(({ isLoading }) => {
+    console.log(isLoading ? 'Loading page' : 'Loading finished');
+  });
+
+  await InAppBrowser.onPageLoadError(({ errorCode }) => {
+    console.error('WebView load error:', errorCode);
+  });
+}
 ```
 
-Refresh the current page in the webview.
+Despite its name, `onPageLoaded()` reports both loading states. Error codes are platform-specific: Android reports WebView errors and HTTP status codes, while iOS reports native navigation error codes.
 
---------------------
+The listener helpers return `Promise<void>`, with no unsubscribe handle. The current wrapper does not retain the handles needed to remove these listeners on close. Re-registering on every open can accumulate callbacks.
 
+## Screenshots
 
-### onNavigation(...)
+`captureScreen(true)` captures the native view, displays the image as the container's background, and hides the live WebView. This lets HTML UI appear above a static representation of the page.
 
 ```typescript
-onNavigation(listenerFunc: ListenerFunc<NavigationEvent>) => Promise<void>
+import { InAppBrowser } from 'pixeltronic-webview-browser';
+
+async function showSnapshot(): Promise<void> {
+  await InAppBrowser.captureScreen(true);
+}
+
+async function resumeLiveView(): Promise<void> {
+  await InAppBrowser.captureScreen(false);
+}
 ```
 
-Event callback when the webview URL changes.
-Response parameters:
-newWindowRequest: boolean;
-isSameHost: boolean;
-complete: boolean;
-This can be used to decide what to do when a URL is requested in a new window
-from the same or different host origin. The callback event.complete(true/false)
-can be used to cancel or continue the load process and to handle the window
-request as desired.
+Call this after opening and loading the page. The public method returns no image data. Its promise can resolve before the image finishes loading and visibility switches; it is not a signal that the snapshot is already displayed. A screenshot is static and cannot receive page interactions.
 
-| Param              | Type                                                                                                        |
-| ------------------ | ----------------------------------------------------------------------------------------------------------- |
-| **`listenerFunc`** | <code><a href="#listenerfunc">ListenerFunc</a>&lt;<a href="#navigationevent">NavigationEvent</a>&gt;</code> |
+## Platform differences
 
---------------------
+These limitations reflect the current implementation:
 
+| Feature                | iOS                                                                                                      | Android                                                                                                |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `headers`              | Applies `User-Agent`; other custom headers are not attached to requests                                  | Headers are stored on open and applied by subsequent `loadUrl()` calls; the initial open bypasses them |
+| `onNavigation()`       | Calls `event.complete(true)` to allow or `event.complete(false)` to cancel a pending navigation response | Emits navigation events, but `complete()` does not currently resume or cancel the pending URL          |
+| `colorScheme`          | Declared in the types but not forwarded by the public wrapper                                            | Declared in the types but not forwarded by the public wrapper                                          |
+| `onUpdateDimensions()` | Declared, but no corresponding native event is emitted                                                   | Declared, but no corresponding native event is emitted                                                 |
 
-### onPageLoaded(...)
+Register `onNavigation()` only when you need to intercept navigation and have verified the behavior on your target platform. On iOS, resolve each callback with `event.complete(...)` so the response can proceed or be cancelled. This callback is not a cross-platform navigation security boundary.
 
-```typescript
-onPageLoaded(listenerFunc: ListenerFunc<PageLoadStatus>) => Promise<void>
+The native view appears above HTML content. Use the screenshot helper when an HTML overlay must cover it. The Android WebView enables JavaScript, file access, and mixed content; load content appropriate for your app's trust model.
+
+## API reference
+
+Import the public singleton as `InAppBrowser`. All methods below return `Promise<void>`.
+
+| Method                                      | Purpose                                                                             |
+| ------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `openWebView(options)`                      | Create the native view and load a URL using the container's bounds                  |
+| `closeWebView()`                            | Destroy the current native view                                                     |
+| `showWebView()` / `hideWebView()`           | Change visibility without destroying the view                                       |
+| `navigateBack()` / `navigateForward()`      | Navigate through page history                                                       |
+| `loadUrl({ url })`                          | Load a URL in the existing view                                                     |
+| `reload()`                                  | Reload the current page                                                             |
+| `updateDimensions({ width, height, x, y })` | Update the native view's bounds                                                     |
+| `onPageLoaded(callback)`                    | Observe `{ isLoading: boolean }`                                                    |
+| `onPageLoadError(callback)`                 | Observe `{ errorCode: number }`                                                     |
+| `onNavigation(callback)`                    | Observe `{ url, newWindowRequest, isSameHost, complete }`; see platform differences |
+| `onUpdateDimensions(callback)`              | Declared resize-event listener; currently not emitted by native code                |
+| `captureScreen(showScreenCapture)`          | Switch between a snapshot background and the live view                              |
+
+### Open options
+
+| Option                               | Type                        | Behavior                                                                    |
+| ------------------------------------ | --------------------------- | --------------------------------------------------------------------------- |
+| `url`                                | `string`                    | Required URL to load                                                        |
+| `element`                            | `HTMLElement`               | Required by the wrapper on native platforms; supplies the view's bounds     |
+| `headers`                            | `{ [key: string]: string }` | Optional headers; see platform differences                                  |
+| `colorScheme`                        | `ColorScheme`               | Declared option with no effect through the current wrapper                  |
+| `width`, `height`, `x`, `y`, `ratio` | `number`                    | Inherited type fields; `openWebView()` uses measured element bounds instead |
+
+For the complete type declarations, see [src/definitions.ts](src/definitions.ts). Some native-facing declarations, including `openSystemBrowser()` and `openBrowser()`, are not implemented by the public singleton and should not be used as public features.
+
+## Development
+
+```sh
+npm ci
+npm run verify:web
+npm run eslint
 ```
 
-Event triggered by the webview when the target URL has finished loading
+Run Android verification with an installed Android SDK and Java 21:
 
-| Param              | Type                                                                                                      |
-| ------------------ | --------------------------------------------------------------------------------------------------------- |
-| **`listenerFunc`** | <code><a href="#listenerfunc">ListenerFunc</a>&lt;<a href="#pageloadstatus">PageLoadStatus</a>&gt;</code> |
-
---------------------
-
-
-### onPageLoadError(...)
-
-```typescript
-onPageLoadError(listenerFunc: ListenerFunc<ErrorCode>) => Promise<void>
+```sh
+npm run verify:android
 ```
 
-Event triggered by the webview when URL loading has failed
-Returns the HTTP request error code.
+On Windows PowerShell, invoke the wrapper directly:
 
-| Param              | Type                                                                                            |
-| ------------------ | ----------------------------------------------------------------------------------------------- |
-| **`listenerFunc`** | <code><a href="#listenerfunc">ListenerFunc</a>&lt;<a href="#errorcode">ErrorCode</a>&gt;</code> |
-
---------------------
-
-
-### onUpdateDimensions(...)
-
-```typescript
-onUpdateDimensions(listenerFunc: ListenerFunc<void>) => Promise<void>
+```powershell
+Set-Location android
+.\gradlew.bat clean build test
 ```
 
-Event triggered by the webview when the webview is resized
+Run iOS verification on macOS with Xcode and CocoaPods:
 
-| Param              | Type                                                              |
-| ------------------ | ----------------------------------------------------------------- |
-| **`listenerFunc`** | <code><a href="#listenerfunc">ListenerFunc</a>&lt;void&gt;</code> |
-
---------------------
-
-
-### captureScreen(...)
-
-```typescript
-captureScreen(showScreenCapture: boolean) => Promise<void>
+```sh
+npm run verify:ios
 ```
 
-Create a screenshot of the current view
-and set it as a background of the web view container element.
-This is needed if there are HTML/Javascript UI elements to be overlaid.
+`npm run verify` runs iOS, Android, and web verification in sequence. `npm run build` generates the web bundle and `dist/docs.json`. This README is maintained manually so it can explain implementation limits alongside the declared API.
 
-| Param                   | Type                 |
-| ----------------------- | -------------------- |
-| **`showScreenCapture`** | <code>boolean</code> |
+The Capacitor 8 upgrade was checked with the web build and Android debug/release builds. An iOS/Xcode build and device behavior still need validation. Android's current unit-test tasks contain no test sources.
 
---------------------
-
-
-### updateDimensions(...)
-
-```typescript
-updateDimensions(options?: Dimensions) => Promise<void>
-```
-
-Update the dimensions of the webview
-
-| Param         | Type                                              |
-| ------------- | ------------------------------------------------- |
-| **`options`** | <code><a href="#dimensions">Dimensions</a></code> |
-
---------------------
-
-
-### Interfaces
-
-
-#### OpenOptions
-
-| Prop              | Type                                                | Description                                                                  |
-| ----------------- | --------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **`url`**         | <code>string</code>                                 | The URL to open the webview to                                               |
-| **`element`**     | <code>HTMLElement</code>                            | element id of DOM node to which the webview should be attached web view only |
-| **`headers`**     | <code><a href="#headers">Headers</a></code>         | Request headers                                                              |
-| **`colorScheme`** | <code><a href="#colorscheme">ColorScheme</a></code> | Set the color scheme for safari system browser and custom tabs               |
-
-
-#### Headers
-
-
-#### ColorScheme
-
-| Prop                            | Type                | Description                                       |
-| ------------------------------- | ------------------- | ------------------------------------------------- |
-| **`toolBarColor`**              | <code>string</code> | Set the toolbar color Android & iOS               |
-| **`navigationBarColor`**        | <code>string</code> | Set the navigation bar color Android only         |
-| **`navigationBarDividerColor`** | <code>string</code> | Set the navigation bar divider color Android only |
-| **`secondaryToolbarColor`**     | <code>string</code> | Set the secondar toolbar color Android only       |
-
-
-#### ListenerFunc
-
-
-#### Dimensions
-
-| Prop         | Type                |
-| ------------ | ------------------- |
-| **`width`**  | <code>number</code> |
-| **`height`** | <code>number</code> |
-| **`x`**      | <code>number</code> |
-| **`y`**      | <code>number</code> |
-| **`ratio`**  | <code>number</code> |
-
-
-### Type Aliases
-
-
-#### NavigationEvent
-
-<code>{ /** * current url being loaded */ url: string; /** * current url target (new window, i.e. _blank / _self, etc) */ newWindowRequest: boolean; /** * current url is from same host */ isSameHost: boolean; /** * complete current url loading */ complete: (allow: boolean) =&gt; void; }</code>
-
-
-#### PageLoadStatus
-
-<code>{ isLoading: boolean }</code>
-
-
-#### ErrorCode
-
-<code>{ errorCode: number }</code>
-
-</docgen-api>
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow. The package declares an MIT license in [package.json](package.json).
